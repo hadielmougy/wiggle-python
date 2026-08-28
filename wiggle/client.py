@@ -3,6 +3,7 @@ manage schedules. Also carries the low-level worker RPCs (poll/complete/fail/hea
 :class:`~wiggle.worker.Worker`."""
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Union
@@ -16,6 +17,27 @@ from ._proto import wiggle_pb2_grpc as rpc
 from .workflow import Blueprint
 
 TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+
+_log = logging.getLogger("wiggle.client")
+
+
+# The "expected" failures -- reconcile waiting for a workflow to be registered, or a server not yet
+# up -- log at DEBUG; anything else is a genuine error and logs at WARNING.
+_EXPECTED_CODES = (grpc.StatusCode.NOT_FOUND, grpc.StatusCode.UNAVAILABLE)
+
+
+class _ErrorLogInterceptor(grpc.UnaryUnaryClientInterceptor):
+    """Logs every failed unary RPC (method, status code, details) in one place. CANCELLED (worker
+    shutdown) is skipped; NOT_FOUND/UNAVAILABLE log at DEBUG, everything else at WARNING."""
+
+    def intercept_unary_unary(self, continuation, client_call_details, request):
+        call = continuation(client_call_details, request)
+        code = call.code()
+        if code is not None and code not in (grpc.StatusCode.OK, grpc.StatusCode.CANCELLED):
+            method = client_call_details.method.rsplit("/", 1)[-1]
+            level = logging.DEBUG if code in _EXPECTED_CODES else logging.WARNING
+            _log.log(level, "rpc %s failed: %s: %s", method, code.name, call.details())
+        return call
 
 
 @dataclass
@@ -49,10 +71,18 @@ class WiggleClient:
     """A thin, Pythonic wrapper over the gRPC control plane. Use as a context manager."""
 
     def __init__(self, target: str = "localhost:8080", *,
-                 credentials: Optional[grpc.ChannelCredentials] = None):
-        self._channel = (grpc.secure_channel(target, credentials) if credentials
-                         else grpc.insecure_channel(target))
+                 credentials: Optional[grpc.ChannelCredentials] = None,
+                 wait_for_ready: bool = True):
+        """``wait_for_ready`` (default True) makes the worker-critical RPCs -- register, get_workflow,
+        poll, complete, fail, heartbeat -- wait for the server to become reachable instead of failing
+        fast with UNAVAILABLE. This lets a worker ride out a cold start, a rolling restart, or a
+        reschedule (many workers coming up before the server is ready) without crashing. Query calls
+        (instance, list, ...) stay fail-fast."""
+        base = (grpc.secure_channel(target, credentials) if credentials
+                else grpc.insecure_channel(target))
+        self._channel = grpc.intercept_channel(base, _ErrorLogInterceptor())
         self._stub = rpc.WiggleControlPlaneStub(self._channel)
+        self._wfr = wait_for_ready
 
     def __enter__(self) -> "WiggleClient":
         return self
@@ -68,14 +98,15 @@ class WiggleClient:
     def register(self, blueprint: Blueprint) -> int:
         """Register a workflow definition; returns its version. Idempotent for the same graph."""
         struct = json_format.ParseDict(blueprint.definition, struct_pb2.Struct())
-        result = self._stub.RegisterWorkflow(pb.WorkflowDefinition(definition=struct))
+        result = self._stub.RegisterWorkflow(pb.WorkflowDefinition(definition=struct),
+                                             wait_for_ready=self._wfr)
         return int(result.version)
 
     def get_workflow(self, name: str) -> dict:
         """The registered graph for ``name`` as a plain dict -- the server's source of truth for a
         workflow's step names, kinds, and queues. Raises ``grpc.RpcError`` (NOT_FOUND) if the
         workflow was never registered. Used by :meth:`Worker.handle` reconciliation."""
-        resp = self._stub.GetWorkflow(pb.GetWorkflowRequest(name=name))
+        resp = self._stub.GetWorkflow(pb.GetWorkflowRequest(name=name), wait_for_ready=self._wfr)
         return json_format.MessageToDict(resp.definition)
 
     def start(self, workflow: Union[Blueprint, str], context: Any, *,
@@ -161,19 +192,21 @@ class WiggleClient:
              lease_millis: int, wait_millis: int) -> pb.TaskList:
         return self._stub.PollTasks(pb.PollRequest(
             worker_id=worker_id, queues=list(queues), max=max_tasks,
-            lease_millis=lease_millis, wait_millis=wait_millis))
+            lease_millis=lease_millis, wait_millis=wait_millis), wait_for_ready=self._wfr)
 
     def complete(self, task_id: str, lease_owner: str, result: Any) -> None:
         self._stub.CompleteTask(pb.TaskResultRequest(
-            task_id=task_id, lease_owner=lease_owner, result=to_value(result)))
+            task_id=task_id, lease_owner=lease_owner, result=to_value(result)), wait_for_ready=self._wfr)
 
     def fail(self, task_id: str, lease_owner: str, message: str, retryable: bool) -> None:
         self._stub.FailTask(pb.TaskFailureRequest(
-            task_id=task_id, lease_owner=lease_owner, message=message, retryable=retryable))
+            task_id=task_id, lease_owner=lease_owner, message=message, retryable=retryable),
+            wait_for_ready=self._wfr)
 
     def heartbeat(self, task_id: str, lease_owner: str, extend_millis: int) -> int:
         return self._stub.HeartbeatTask(pb.HeartbeatRequest(
-            task_id=task_id, lease_owner=lease_owner, extend_millis=extend_millis)).lease_expires_at
+            task_id=task_id, lease_owner=lease_owner, extend_millis=extend_millis),
+            wait_for_ready=self._wfr).lease_expires_at
 
 
 def _view(v: pb.InstanceView) -> InstanceView:
