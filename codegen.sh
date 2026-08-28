@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
-# Regenerates the gRPC stubs in wiggle/_proto/ from the canonical proto (../../proto).
-# Run this whenever proto/src/main/proto/wiggle.proto changes.
+# Regenerates the gRPC stubs in wiggle/_proto/ from the vendored proto (proto/wiggle.proto).
+# The proto is the wire contract with the Wiggle server; keep proto/wiggle.proto in sync with the
+# canonical copy in the server repo (wiggle: proto/src/main/proto/wiggle.proto) and re-run this.
 #
-#   pip install grpcio-tools
-#   clients/python/codegen.sh
+#   pip install grpcio-tools     # (or: pip install -e '.[dev]')
+#   ./codegen.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PROTO_DIR="../../proto/src/main/proto"
+PROTO_DIR="proto"
 OUT="wiggle/_proto"
 
 python3 -m grpc_tools.protoc \

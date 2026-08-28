@@ -12,12 +12,13 @@ handlers can run its steps.
 ## Install
 
 ```bash
-pip install grpcio protobuf
-# from a checkout:
-pip install clients/python            # or: pip install -e clients/python
+pip install wiggle-client              # from PyPI (once published)
+# or from a checkout:
+pip install -e .                       # add '.[dev]' for the codegen + test tooling
 ```
 
-Requires Python 3.9+ and a running Wiggle server (`docker run … hadielmougy/wiggle`, or `./gradlew :dist:run`).
+Requires Python 3.9+ and a running Wiggle server — see the [engine repo](https://github.com/hadielmougy/wiggle)
+(`docker run … hadielmougy/wiggle`, or `./gradlew :dist:run` there).
 
 ## Quick start
 
@@ -47,7 +48,7 @@ with WiggleClient("localhost:8080") as client:
 Run the bundled example against a server on `:8080`:
 
 ```bash
-PYTHONPATH=clients/python python clients/python/examples/order.py
+python examples/order.py               # after `pip install -e .` (or: PYTHONPATH=. python examples/order.py)
 ```
 
 ## The DSL
@@ -180,13 +181,9 @@ unset unless you have a specific reason.
 Offline tests (no server needed) cover the DSL graph shapes and the wire conversions:
 
 ```bash
-pip install grpcio protobuf pytest
-cd clients/python && pytest -q
+pip install -e '.[dev]'
+pytest -q
 ```
-
-They're also wired into Gradle — `./gradlew build` (or `:clients:python:pyTest`) runs them, and
-**skips cleanly** (a warning, not a failure) when Python 3 / grpcio / pytest are absent, or with
-`-PskipPython`.
 
 ## Notes & limits
 

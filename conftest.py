@@ -1,5 +1,5 @@
-"""Put the package root on sys.path so `import wiggle` works when running pytest from this
-directory, both under Gradle and by hand (`pytest` in clients/python)."""
+"""Put the package root on sys.path so `import wiggle` works when running `pytest` from the repo
+root without installing the package first."""
 import os
 import sys
 

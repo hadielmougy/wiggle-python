@@ -18,6 +18,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["grpcio-tools>=1.60", "pytest>=7"]
 
+[project.urls]
+Homepage = "https://github.com/hadielmougy/wiggle-python"
+Repository = "https://github.com/hadielmougy/wiggle-python"
+Engine = "https://github.com/hadielmougy/wiggle"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["wiggle*"]
