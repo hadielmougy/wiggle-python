@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "wiggle-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python client and worker for the Wiggle workflow engine"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 authors = [{ name = "Hadi Elmougy" }]
 dependencies = [
     "grpcio>=1.60",
@@ -23,6 +23,7 @@ Homepage = "https://github.com/hadielmougy/wiggle-python"
 Repository = "https://github.com/hadielmougy/wiggle-python"
 Engine = "https://github.com/hadielmougy/wiggle"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["wiggle*"]
+# Explicit package list (not auto-discovery) so the generated gRPC stubs in wiggle/_proto always ship,
+# regardless of the build environment's setuptools version.
+[tool.setuptools]
+packages = ["wiggle", "wiggle._proto"]

@@ -12,9 +12,9 @@ handlers can run its steps.
 ## Install
 
 ```bash
-pip install wiggle-client              # from PyPI (once published)
+pip install wiggle-client
 # or from a checkout:
-pip install -e .                       # add '.[dev]' for the codegen + test tooling
+pip install -e .
 ```
 
 Requires Python 3.9+ and a running Wiggle server — see the [engine repo](https://github.com/hadielmougy/wiggle)
