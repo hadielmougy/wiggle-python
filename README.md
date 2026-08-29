@@ -1,9 +1,10 @@
 # Wiggle — Python client
 
-An idiomatic Python client and worker for the [Wiggle](../../README.md) workflow engine. It speaks
-the same gRPC control plane as the Java client, so **Python and Java workers interoperate** on the
-same server: define a workflow in either language, and any worker that registers the matching
-handlers can run its steps.
+An idiomatic Python client and worker for [Wiggle](../../README.md), the durable state-machine
+platform. It speaks the same gRPC control plane as the Java client, so **Python and Java workers
+interoperate** on the same server: define a flow in either language, and any worker that registers the
+matching handlers can run its steps. In a coordinator-sharded deployment the client resolves the
+owning cell per instance.
 
 - **Control client** — register workflows, start and track instances, deliver signals, manage schedules.
 - **Worker** — implement steps by name; pull tasks you have capacity for, run handlers, report results; automatic lease heartbeats and retries.

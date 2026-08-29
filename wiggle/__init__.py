@@ -7,6 +7,7 @@ instances from the client, and implement its steps with a worker that binds hand
 same gRPC control plane as the Java and Go clients, so their workers interoperate.
 """
 from .client import InstanceView, ScheduleView, WiggleClient
+from .resolver import CellResolver, Placement, is_legacy_id, parse_id
 from .worker import Handlers, PermanentError, Worker
 from .workflow import (
     AwaitSignal,
@@ -50,6 +51,10 @@ __all__ = [
     "Worker",
     "Handlers",
     "PermanentError",
+    "CellResolver",
+    "Placement",
+    "parse_id",
+    "is_legacy_id",
 ]
 
 __version__ = "0.1.0"
