@@ -6,18 +6,19 @@ stored wrappers directly, so ``gradle build`` exercises the binding without a li
 import grpc
 import pytest
 
-from wiggle import Workflow, Worker
+from wiggle import Effect, Gate, Graph, Handlers, Step, Worker
+from wiggle.worker import _canonical
 
 
 def _graph(*, authorise_queue="payments"):
     """The registered graph as ``get_workflow`` returns it: a Java-authored order flow that a Python
     worker will implement one step of, by name."""
-    return (Workflow("order-fulfilment")
-            .step("validate", lambda o: o)
-            .gate("in-stock", lambda o: o["qty"] > 0)
-            .step("authorise", lambda o: o, queue=authorise_queue)
-            .effect("audit", lambda o: None)
-            .build()).definition
+    return Graph("order-fulfilment", [
+        Step("validate"),
+        Gate("in-stock"),
+        Step("authorise", queue=authorise_queue),
+        Effect("audit"),
+    ]).compile().definition
 
 
 class _FakeRpcError(grpc.RpcError):
@@ -42,7 +43,7 @@ class _FakeClient:
 
 
 def _worker(graphs, **kw):
-    w = Worker(_FakeClient(graphs), "w-test", register_on_start=False, **kw)
+    w = Worker(_FakeClient(graphs), "w-test", **kw)
     return w
 
 
@@ -133,3 +134,143 @@ def test_handle_gate_wrapper_returns_bool():
     wrapper = w._handlers["order-fulfilment#in-stock"]
     assert wrapper({"qty": 3}) is True
     assert wrapper({"qty": 0}) is False
+
+
+# ---------------------------------------------------------------- register_handlers (object)
+
+def test_canonical_folds_case_styles():
+    for name in ("in-stock", "in_stock", "inStock", "InStock", "instock", "IN_STOCK", "in stock"):
+        assert _canonical(name) == "instock"
+    assert _canonical("autoApprove") == _canonical("auto-approve") == "autoapprove"
+    assert _canonical("HTTPServer") == "httpserver"
+
+
+class _OrderHandlers(Handlers):
+    """One method per step; names in mixed styles, kinds by return annotation. The graph step names
+    are ``validate`` / ``in-stock`` / ``authorise`` / ``audit``."""
+    workflow = "order-fulfilment"
+
+    def validate(self, o) -> dict:
+        return {**o, "status": "VALIDATED"}
+
+    def inStock(self, o) -> bool:            # camelCase -> matches graph's "in-stock" gate
+        return o["qty"] > 0
+
+    def authorise(self, o) -> dict:
+        return {**o, "paid": True}
+
+    def audit(self, o) -> None:              # -> None: a side effect
+        o.setdefault("_audited", []).append(o.get("orderId"))
+
+    def _helper(self, o):                    # underscore-prefixed: ignored
+        return o
+
+
+def test_register_handlers_matches_by_name_and_binds_all_kinds():
+    w = _worker({"order-fulfilment": _graph()})
+    w.register_handlers(_OrderHandlers())    # workflow taken from the class attribute
+    w._reconcile()
+    handlers = w._handlers
+    assert set(handlers) == {"order-fulfilment#validate", "order-fulfilment#in-stock",
+                             "order-fulfilment#authorise", "order-fulfilment#audit"}
+    # gate wrapper -> bool
+    assert handlers["order-fulfilment#in-stock"]({"qty": 2}) is True
+    assert handlers["order-fulfilment#in-stock"]({"qty": 0}) is False
+    # task wrapper -> only the diff
+    assert handlers["order-fulfilment#authorise"]({"orderId": "o1", "qty": 1}) == {"paid": True}
+    # effect wrapper -> None (context unchanged on the wire)
+    assert handlers["order-fulfilment#audit"]({"orderId": "o1"}) is None
+    # queue discovered from the graph
+    assert "payments" in w._served_queues
+
+
+def test_register_handlers_takes_explicit_workflow_over_attribute():
+    class H(Handlers):
+        def validate(self, o) -> dict:
+            return o
+    w = _worker({"order-fulfilment": _graph()})
+    w.register_handlers(H(), workflow="order-fulfilment")
+    w._reconcile()
+    assert "order-fulfilment#validate" in w._handlers
+
+
+def test_register_handlers_needs_a_workflow_name():
+    class H(Handlers):
+        def validate(self, o) -> dict:
+            return o
+    w = _worker({"order-fulfilment": _graph()})
+    with pytest.raises(ValueError, match="needs a workflow name"):
+        w.register_handlers(H())          # no attribute, no arg
+
+
+def test_register_handlers_rejects_case_fold_duplicates():
+    class H(Handlers):
+        workflow = "order-fulfilment"
+
+        def in_stock(self, o) -> bool:
+            return True
+
+        def inStock(self, o) -> bool:     # folds to the same step name -> ambiguous
+            return True
+    w = _worker({"order-fulfilment": _graph()})
+    with pytest.raises(ValueError, match="both map to the same step name 'instock'"):
+        w.register_handlers(H())
+
+
+def test_register_handlers_rejects_method_matching_no_step():
+    class H(Handlers):
+        workflow = "order-fulfilment"
+
+        def validate(self, o) -> dict:
+            return o
+
+        def shipItNow(self, o) -> dict:   # no such step in the graph
+            return o
+    w = _worker({"order-fulfilment": _graph()})
+    w.register_handlers(H())
+    with pytest.raises(ValueError, match="handler 'shipItNow' matches no step"):
+        w._reconcile()
+
+
+def test_register_handlers_rejects_kind_mismatch_from_annotation():
+    class H(Handlers):
+        workflow = "order-fulfilment"
+
+        def inStock(self, o) -> dict:     # graph "in-stock" is a gate, but annotated to return dict
+            return o
+    w = _worker({"order-fulfilment": _graph()})
+    w.register_handlers(H())
+    with pytest.raises(ValueError, match="is a gate .* must return bool"):
+        w._reconcile()
+
+
+def test_register_handlers_gate_kind_follows_graph_when_unannotated():
+    class H(Handlers):
+        workflow = "order-fulfilment"
+
+        def in_stock(self, o):            # no annotation: graph says PREDICATE -> gate wrapper
+            return o.get("qty", 0) > 0
+    w = _worker({"order-fulfilment": _graph()})
+    w.register_handlers(H())
+    w._reconcile()
+    wrapper = w._handlers["order-fulfilment#in-stock"]
+    assert wrapper({"qty": 5}) is True and wrapper({"qty": 0}) is False
+
+
+def test_register_handlers_rejects_bad_arity():
+    class H(Handlers):
+        workflow = "order-fulfilment"
+
+        def validate(self, o, extra) -> dict:   # two required args, not a handler shape
+            return o
+    w = _worker({"order-fulfilment": _graph()})
+    with pytest.raises(ValueError, match="must accept a single context argument"):
+        w.register_handlers(H())
+
+
+def test_register_handlers_and_handle_conflict_is_a_duplicate():
+    w = _worker({"order-fulfilment": _graph()})
+    w.handle("order-fulfilment", "validate", lambda o: o)
+    w.register_handlers(_OrderHandlers())
+    with pytest.raises(ValueError, match="duplicate handler for activity 'order-fulfilment#validate'"):
+        w._reconcile()

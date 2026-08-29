@@ -3,18 +3,21 @@ the result. Workers hold no durable state -- a crash loses at most the in-flight
 server re-leases and re-runs."""
 from __future__ import annotations
 
+import inspect
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Iterable, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Optional
 
 import grpc
 
 from ._convert import from_value, shallow_diff
 from .client import WiggleClient
-from .workflow import Activity, Blueprint, Predicate, SideEffect
+from .workflow import Activity, Predicate, SideEffect
 
 log = logging.getLogger("wiggle.worker")
 
@@ -23,10 +26,97 @@ class PermanentError(Exception):
     """Raise from a handler to fail the step without retrying (a bad request, not a blip)."""
 
 
-class Worker:
-    """Register blueprints (for their handlers), then :meth:`start` to pull and run work.
+class Handlers:
+    """Optional base for a class whose methods implement a workflow's steps -- one public method per
+    step, each taking the context. Register an instance with :meth:`Worker.register_handlers`.
 
-    >>> worker = Worker(client, "worker-1").register(wf)
+    Method names match step names **regardless of case style**: ``in_stock``, ``inStock``, and a graph
+    step named ``in-stock`` all normalise the same. The method's return annotation picks the kind:
+    ``-> bool`` binds a gate (predicate), ``-> None`` a side effect, anything else (or no annotation) a
+    task. Prefix helper methods with ``_`` so they are not treated as step handlers.
+
+    Set the class attribute ``workflow`` to the workflow name these handlers implement, or pass
+    ``workflow=`` to :meth:`Worker.register_handlers`.
+    """
+
+    workflow: Optional[str] = None
+
+
+# tokens split on any non-alphanumeric run, and on camelCase / acronym boundaries
+_NON_ALNUM = re.compile(r"[^0-9A-Za-z]+")
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_ACRONYM_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _canonical(name: str) -> str:
+    """Fold a name to a case/style-independent key: lowercase alphanumeric tokens, concatenated. So
+    ``in-stock``, ``in_stock``, ``inStock``, ``InStock``, and ``instock`` all yield ``instock``."""
+    spaced = _NON_ALNUM.sub(" ", name)
+    spaced = _ACRONYM_BOUNDARY.sub(" ", _CAMEL_BOUNDARY.sub(" ", spaced))
+    return "".join(tok.lower() for tok in spaced.split())
+
+
+def _accepts_single_context(sig: inspect.Signature) -> bool:
+    """True if the (already-bound) method takes exactly one required positional arg (the context) --
+    or none plus ``*args``. Extra keyword/defaulted params are fine."""
+    required = 0
+    has_var_positional = False
+    for p in sig.parameters.values():
+        if p.kind == inspect.Parameter.VAR_POSITIONAL:
+            has_var_positional = True
+        elif p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            if p.default is inspect.Parameter.empty:
+                required += 1
+    return required == 1 or (required == 0 and has_var_positional)
+
+
+@dataclass
+class _Candidate:
+    name: str                 # the original method name, for error messages
+    method: Callable
+    return_annotation: Any    # inspect return annotation (drives the kind)
+
+
+def _collect_handler_methods(handlers: object) -> dict[str, _Candidate]:
+    """Introspect ``handlers`` for its step methods, keyed by canonical name. Raises if two public
+    methods fold to the same canonical name (ambiguous across case styles), or if a public method does
+    not take a single context argument."""
+    found: dict[str, _Candidate] = {}
+    for attr in sorted(dir(handlers)):
+        if attr.startswith("_") or attr == "workflow":
+            continue
+        try:
+            member = getattr(handlers, attr)
+        except Exception:  # noqa: BLE001 - a property that raises is not a handler
+            continue
+        if not callable(member) or inspect.isclass(member):
+            continue
+        try:
+            sig = inspect.signature(member)
+        except (TypeError, ValueError):
+            continue
+        if not _accepts_single_context(sig):
+            raise ValueError(f"handler method '{attr}' must accept a single context argument "
+                             f"(prefix helper methods with '_' to skip them)")
+        canon = _canonical(attr)
+        if not canon:
+            continue
+        if canon in found:
+            raise ValueError(f"handler methods '{found[canon].name}' and '{attr}' both map to the "
+                             f"same step name '{canon}'; names differing only in case/style are "
+                             f"ambiguous -- rename one")
+        found[canon] = _Candidate(attr, member, sig.return_annotation)
+    if not found:
+        raise ValueError("no handler methods found on the object (public methods taking one context "
+                         "argument)")
+    return found
+
+
+class Worker:
+    """Bind handlers to workflow steps by name, then :meth:`start` to pull and run work. Topology is
+    registered separately (``client.register`` of a compiled :class:`Graph`, or the ``wiggle`` CLI).
+
+    >>> worker = Worker(client, "worker-1").handle("order", "validate", validate)
     >>> worker.start()          # background threads; call stop() to drain
     """
 
@@ -34,7 +124,7 @@ class Worker:
                  concurrency: Optional[int] = None, lease_s: float = 30.0,
                  long_poll_wait_s: float = 10.0, idle_backoff_s: float = 0.2,
                  error_backoff_s: float = 2.0, queues: Optional[Iterable[str]] = None,
-                 register_on_start: bool = True, await_registration_s: float = 0.0):
+                 await_registration_s: float = 0.0):
         self._client = client
         self.worker_id = worker_id
         self._concurrency = concurrency or os.cpu_count() or 4
@@ -43,24 +133,17 @@ class Worker:
         self._idle_backoff = idle_backoff_s
         self._error_backoff = error_backoff_s
         self._explicit_queues = set(queues) if queues else None
-        self._register_on_start = register_on_start
         self._await_registration_s = await_registration_s
 
         self._handlers: dict[str, Callable] = {}
         self._queues: set[str] = set()
-        self._blueprints: list[Blueprint] = []
         self._claims: list[tuple[str, str, str]] = []   # (workflow, step, expected NodeKind)
+        self._handler_sets: list[tuple[str, dict[str, "_Candidate"]]] = []  # (workflow, candidates)
         self._executor: Optional[ThreadPoolExecutor] = None
         self._poll_thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self._inflight = 0
         self._lock = threading.Lock()
-
-    def register(self, blueprint: Blueprint) -> "Worker":
-        self._handlers.update(blueprint.handlers)
-        self._queues.update(blueprint.queues)
-        self._blueprints.append(blueprint)
-        return self
 
     def handle(self, workflow: str, step: str, fn: Activity) -> "Worker":
         """Bind a handler to one step of an already-registered workflow, by name -- no topology
@@ -86,6 +169,26 @@ class Worker:
             return None
         return self._bind(workflow, step, "TASK", wrapper)
 
+    def register_handlers(self, handlers: object, *, workflow: Optional[str] = None) -> "Worker":
+        """Bind a whole object's methods as step handlers in one call. Each public method that takes a
+        context becomes a handler; on :meth:`start` the worker matches it to a step of ``workflow`` by
+        **case-insensitive name** (``in_stock``/``inStock`` both match a step named ``in-stock``) and
+        picks the kind from the method's return annotation (``-> bool`` gate, ``-> None`` effect, else
+        task). The graph is the source of truth for the exact step name and whether it is a gate.
+
+        ``workflow`` may be passed here or set as a ``workflow`` attribute on the object (e.g. a
+        :class:`Handlers` subclass). Two methods whose names collide under case-folding are rejected
+        here (ambiguous); a method matching no step, or a kind clash with the graph, is caught on
+        :meth:`start` during reconciliation.
+        """
+        wf = workflow or getattr(handlers, "workflow", None)
+        if not wf:
+            raise ValueError("register_handlers needs a workflow name: pass workflow=... or set a "
+                             "'workflow' attribute on the handlers object")
+        candidates = _collect_handler_methods(handlers)   # validates case-fold duplicates
+        self._handler_sets.append((wf, candidates))
+        return self
+
     def _bind(self, workflow: str, step: str, kind: str, wrapper: Callable) -> "Worker":
         if not workflow or not step:
             raise ValueError("workflow and step are required")
@@ -103,10 +206,7 @@ class Worker:
     def start(self) -> "Worker":
         if self._running.is_set():
             return self
-        if self._register_on_start:
-            for bp in self._blueprints:
-                self._client.register(bp)
-        if self._claims:
+        if self._claims or self._handler_sets:
             self._reconcile()
         self._running.set()
         self._executor = ThreadPoolExecutor(max_workers=self._concurrency,
@@ -172,6 +272,65 @@ class Worker:
             unclaimed = sorted(a.split("#", 1)[1] for a in set(nodes) - served)
             if unclaimed:   # info, not an error: a polyglot worker may intentionally serve a subset
                 log.info("workflow '%s' has steps served by no handler on this worker: %s", wf, unclaimed)
+        for wf, candidates in self._handler_sets:
+            self._match_handler_set(wf, candidates)
+
+    def _match_handler_set(self, wf: str, candidates: dict[str, "_Candidate"]) -> None:
+        """Match a :meth:`register_handlers` object's methods to ``wf``'s steps by canonical name, then
+        bind each with a wrapper whose kind follows the graph (gate vs task) and the method's return
+        annotation (task vs effect). A method matching no step, or a kind clash, fails fast."""
+        graph = self._fetch_graph(wf)
+        nodes = {n["name"]: n for n in graph.get("nodes", [])
+                 if n.get("kind") in ("TASK", "PREDICATE") and "name" in n}
+        by_canon: dict[str, tuple[str, dict]] = {}
+        for name, node in nodes.items():
+            by_canon.setdefault(_canonical(name), (name, node))   # graph step names are already unique
+        served: set[str] = set()
+        for canon, cand in candidates.items():
+            match = by_canon.get(canon)
+            if match is None:
+                avail = sorted(nodes)
+                raise ValueError(f"handler '{cand.name}' matches no step in workflow '{wf}' "
+                                 f"(available steps: {avail})")
+            step_name, node = match
+            activity = f"{wf}#{step_name}"
+            if activity in self._handlers:
+                raise ValueError(f"duplicate handler for activity '{activity}'")
+            self._handlers[activity] = self._wrapper_for(cand, node, activity)
+            self._queues.add(node.get("queue", wf))
+            served.add(step_name)
+        unclaimed = sorted(set(nodes) - served)
+        if unclaimed:   # info, not an error: a polyglot worker may intentionally serve a subset
+            log.info("workflow '%s' has steps served by no handler on this worker: %s", wf, unclaimed)
+
+    @staticmethod
+    def _wrapper_for(cand: "_Candidate", node: dict, activity: str) -> Callable:
+        """Build the runtime wrapper for a matched method, validating the method's return annotation
+        against the graph node's kind (the graph decides gate vs task; the annotation decides task vs
+        effect)."""
+        kind = node["kind"]
+        ret = cand.return_annotation
+        method = cand.method
+        empty = inspect.Signature.empty
+        if kind == "PREDICATE":
+            if ret is not empty and ret is not bool:
+                raise ValueError(f"activity '{activity}' is a gate (PREDICATE) but handler "
+                                 f"'{cand.name}' is annotated to return {ret!r}; a gate must return bool")
+            return lambda ctx: bool(method(ctx))
+        # TASK node: task unless the method is a declared side effect (-> None), a bool is a mistake here
+        if ret is bool:
+            raise ValueError(f"activity '{activity}' is a TASK but handler '{cand.name}' is annotated "
+                             f"to return bool; that looks like a gate -- did you mean a PREDICATE step?")
+        if ret is None:   # explicit `-> None`: a side effect, context unchanged
+            def effect_wrapper(ctx):
+                method(ctx)
+                return None
+            return effect_wrapper
+
+        def task_wrapper(ctx):
+            out = method(ctx)
+            return shallow_diff(ctx, out) if out is not None else None
+        return task_wrapper
 
     def _fetch_graph(self, workflow: str) -> dict:
         """Fetch the registered graph, optionally waiting out a registration race (the authoring

@@ -67,7 +67,7 @@ PY
 TMP="$(mktemp -d)"
 python3 -m venv "$TMP/venv"
 "$TMP/venv/bin/pip" install -q "$WHEEL"
-"$TMP/venv/bin/python" -c "from wiggle import Workflow, WiggleClient, Worker; print('   clean install imports OK')"
+"$TMP/venv/bin/python" -c "from wiggle import Graph, Step, WiggleClient, Worker; print('   clean install imports OK')"
 rm -rf "$TMP"
 
 echo "==> built + verified:"; ls -1 dist

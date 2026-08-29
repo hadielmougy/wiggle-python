@@ -5,29 +5,40 @@
 """
 import os
 
-from wiggle import Retry, WiggleClient, Worker, Workflow
+from wiggle import Effect, Gate, Graph, Retry, Step, WiggleClient, Worker
 
 
-def build() -> "Workflow":
+def topology() -> "Graph":
+    # Declarative topology -- a Graph that mirrors the YAML/graph schema. Handlers bind by name below.
+    return Graph("py-order", [
+        Step("validate"),
+        Gate("in-stock"),
+        Step("charge", queue="payments", retry=Retry.exponential(5, 0.1)),
+        Step("ship"),
+        Effect("notify"),
+    ])
+
+
+def bind(worker: Worker) -> Worker:
+    # A worker implements steps by name; a step returns the whole context, the engine merges the diff.
     return (
-        Workflow("py-order")
-        .step("validate", lambda o: {**o, "status": "VALIDATED"})
-        .gate("in-stock", lambda o: o["quantity"] > 0)
-        .step("charge", lambda o: {**o, "paymentRef": f"auth-{o['orderId']}"},
-              queue="payments", retry=Retry.exponential(5, 0.1))
-        .step("ship", lambda o: {**o, "trackingLabel": f"DHL-{o['orderId']}"})
-        .effect("notify", lambda o: print(f"   [worker] {o['orderId']} -> {o['status']} "
-                                          f"paid={o.get('paymentRef')} tracking={o.get('trackingLabel')}"))
-        .build()
+        worker
+        .handle("py-order", "validate", lambda o: {**o, "status": "VALIDATED"})
+        .handle_gate("py-order", "in-stock", lambda o: o["quantity"] > 0)
+        .handle("py-order", "charge", lambda o: {**o, "paymentRef": f"auth-{o['orderId']}"})
+        .handle("py-order", "ship", lambda o: {**o, "trackingLabel": f"DHL-{o['orderId']}"})
+        .handle_effect("py-order", "notify",
+                       lambda o: print(f"   [worker] {o['orderId']} -> {o['status']} "
+                                       f"paid={o.get('paymentRef')} tracking={o.get('trackingLabel')}"))
     )
 
 
 def main() -> None:
     url = os.environ.get("WIGGLE_URL", "localhost:8080")
-    wf = build()
+    wf = topology().compile()
     with WiggleClient(url) as client:
         client.register(wf)
-        worker = Worker(client, "py-worker-1").register(wf).start()
+        worker = bind(Worker(client, "py-worker-1")).start()
         try:
             ids = [client.start(wf, {"orderId": f"A-{1000 + i}", "quantity": 1 + (i % 3)})
                    for i in range(5)]

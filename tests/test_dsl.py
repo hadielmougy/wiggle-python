@@ -1,11 +1,26 @@
-"""Offline tests for the Wiggle Python DSL and wire conversions -- no server required.
+"""Offline tests for the Wiggle Python topology and wire conversions -- no server required.
 
-They build workflows and assert on the compiled definition (node kinds, edge wiring, queues,
-version determinism) plus the value/diff helpers, so `gradle build` exercises the client.
+They build workflows as declarative Graphs and assert on the compiled definition (node kinds, edge
+wiring, queues, version determinism) plus the value/diff helpers.
 """
 import pytest
 
-from wiggle import Branch, Case, Retry, Workflow
+from wiggle import (
+    AwaitSignal,
+    Branch,
+    Case,
+    Choose,
+    DoWhile,
+    Effect,
+    Fork,
+    ForkEach,
+    Gate,
+    Graph,
+    Retry,
+    Sleep,
+    Step,
+    SubWorkflow,
+)
 from wiggle._convert import from_value, shallow_diff, to_value
 
 
@@ -20,11 +35,11 @@ def _kind(bp, kind):
 # ---------------------------------------------------------------- linear + gate
 
 def test_linear_chain_and_gated_end():
-    bp = (Workflow("wf")
-          .step("a", lambda o: o)
-          .gate("g", lambda o: True)
-          .effect("b", lambda o: None)
-          .build())
+    bp = Graph("wf", [
+        Step("a"),
+        Gate("g"),
+        Effect("b"),
+    ]).compile()
     byid = _by_id(bp)
     a = next(n for n in byid.values() if n.get("name") == "a")
     g = next(n for n in byid.values() if n.get("name") == "g")
@@ -32,18 +47,17 @@ def test_linear_chain_and_gated_end():
     assert bp.definition["startNode"] == a["id"]
     assert a["kind"] == "TASK" and a["next"] == g["id"]
     assert g["kind"] == "PREDICATE" and g["next"] == b["id"]
+    assert a["activity"] == "wf#a"
     # the gate's false path ends the instance as gated:g
     gated = byid[g["altNext"]]
     assert gated["kind"] == "END" and gated["reason"] == "gated:g"
-    # handlers are keyed by "<workflow>#<step>"
-    assert set(bp.handlers) == {"wf#a", "wf#g", "wf#b"}
 
 
 def test_default_queue_is_workflow_name_and_per_step_override():
-    bp = (Workflow("orders")
-          .step("a", lambda o: o)
-          .step("b", lambda o: o, queue="payments")
-          .build())
+    bp = Graph("orders", [
+        Step("a"),
+        Step("b", queue="payments"),
+    ]).compile()
     byid = _by_id(bp)
     assert next(n for n in byid.values() if n.get("name") == "a")["queue"] == "orders"
     assert next(n for n in byid.values() if n.get("name") == "b")["queue"] == "payments"
@@ -51,7 +65,7 @@ def test_default_queue_is_workflow_name_and_per_step_override():
 
 
 def test_retry_json_shape():
-    bp = Workflow("wf").step("a", lambda o: o, retry=Retry.exponential(5, 0.1)).build()
+    bp = Graph("wf", [Step("a", retry=Retry.exponential(5, 0.1))]).compile()
     retry = next(n for n in bp.definition["nodes"] if n.get("name") == "a")["retry"]
     assert retry == {"maxAttempts": 5, "initialBackoffMillis": 100, "multiplier": 2.0,
                      "maxBackoffMillis": 300000, "jitter": 0.2}
@@ -59,7 +73,7 @@ def test_retry_json_shape():
 
 def test_version_is_deterministic_and_positive_int32():
     def build():
-        return (Workflow("wf").step("a", lambda o: o).gate("g", lambda o: True).build())
+        return Graph("wf", [Step("a"), Gate("g")]).compile()
     v1, v2 = build().version, build().version
     assert v1 == v2
     assert 0 < v1 <= 0x7FFFFFFF
@@ -67,12 +81,11 @@ def test_version_is_deterministic_and_positive_int32():
 
 def test_version_is_structural_independent_of_node_ids():
     from wiggle.workflow import _content_version
-    bp = (Workflow("wf")
-          .step("a", lambda o: o)
-          .fork(Branch.of("l", lambda b: b.step("l1", lambda o: o)),
-                Branch.of("r", lambda b: b.step("r1", lambda o: o)))
-          .step("z", lambda o: o)
-          .build())
+    bp = Graph("wf", [
+        Step("a"),
+        Fork([Branch("l", [Step("l1")]), Branch("r", [Step("r1")])]),
+        Step("z"),
+    ]).compile()
     # relabel every node id to a totally different scheme, rewriting all edge references too
     remap = {n["id"]: f"x{i}" for i, n in enumerate(bp.definition["nodes"])}
     relabelled = {**bp.definition, "startNode": remap[bp.definition["startNode"]], "nodes": []}
@@ -89,46 +102,50 @@ def test_version_is_structural_independent_of_node_ids():
 
 
 def test_version_changes_when_structure_changes():
-    a = Workflow("wf").step("a", lambda o: o).build().version
-    b = Workflow("wf").step("a", lambda o: o).step("b", lambda o: o).build().version
+    a = Graph("wf", [Step("a")]).compile().version
+    b = Graph("wf", [Step("a"), Step("b")]).compile().version
     assert a != b
 
 
 def test_explicit_version_override_and_validation():
-    bp = Workflow("wf", version=42).step("a", lambda o: o).build()
+    bp = Graph("wf", [Step("a")], version=42).compile()
     assert bp.version == 42 and bp.definition["version"] == 42
     with pytest.raises(ValueError):
-        Workflow("wf", version=0)
+        Graph("wf", [Step("a")], version=0).compile()
     with pytest.raises(ValueError):
-        Workflow("wf", version=0x80000000)
+        Graph("wf", [Step("a")], version=0x80000000).compile()
     with pytest.raises(TypeError):
-        Workflow("wf", version=True)   # bool is not a valid version
+        Graph("wf", [Step("a")], version=True).compile()   # bool is not a valid version
+
+
+def test_empty_workflow_rejected():
+    with pytest.raises(ValueError, match="no steps"):
+        Graph("wf", []).compile()
 
 
 # ---------------------------------------------------------------- timers / signals
 
 def test_sleep_and_signal_nodes():
-    bp = (Workflow("wf")
-          .sleep("nap", millis=250)
-          .await_signal("go", timeout_s=2)
-          .step("done", lambda o: o)
-          .build())
+    bp = Graph("wf", [
+        Sleep("nap", millis=250),
+        AwaitSignal("go", timeout_s=2),
+        Step("done"),
+    ]).compile()
     byid = _by_id(bp)
     nap = next(n for n in byid.values() if n.get("name") == "nap")
     go = next(n for n in byid.values() if n.get("name") == "go")
     assert nap["kind"] == "SLEEP" and nap["sleepMillis"] == 250
     assert go["kind"] == "SIGNAL" and go["sleepMillis"] == 2000
-    # timers/signals have no worker handler
-    assert "wf#nap" not in bp.handlers and "wf#go" not in bp.handlers
+    # timers/signals carry no activity (no worker handler)
+    assert "activity" not in nap and "activity" not in go
 
 
 def test_await_signal_escalation_branch_wiring():
-    bp = (Workflow("wf")
-          .step("request", lambda o: o)
-          .await_signal("approval", timeout_s=60,
-                        escalation=lambda b: b.step("auto-approve", lambda o: {**o, "auto": True}))
-          .step("finish", lambda o: o)
-          .build())
+    bp = Graph("wf", [
+        Step("request"),
+        AwaitSignal("approval", timeout_s=60, escalation=[Step("auto-approve")]),
+        Step("finish"),
+    ]).compile()
     byid = _by_id(bp)
     sig = next(n for n in byid.values() if n.get("name") == "approval")
     auto = next(n for n in byid.values() if n.get("name") == "auto-approve")
@@ -137,34 +154,35 @@ def test_await_signal_escalation_branch_wiring():
     assert sig["next"] == finish["id"]        # delivery continues to `finish`
     assert sig["altNext"] == auto["id"]       # timeout escalates to the branch
     assert auto["next"] == finish["id"]       # escalation rejoins the flow at `finish`
-    assert bp.handlers["wf#auto-approve"]     # the escalation step is a real worker handler
+    assert auto["activity"] == "wf#auto-approve"   # the escalation step is a real worker step
 
 
 def test_await_signal_without_escalation_has_no_alt_edge():
-    bp = Workflow("wf").step("a", lambda o: o).await_signal("s", timeout_s=5).step("b", lambda o: o).build()
+    bp = Graph("wf", [Step("a"), AwaitSignal("s", timeout_s=5), Step("b")]).compile()
     sig = next(n for n in bp.definition["nodes"] if n.get("name") == "s")
     assert "altNext" not in sig
 
 
 def test_await_signal_escalation_requires_a_timeout():
     with pytest.raises(ValueError, match="positive timeout"):
-        Workflow("wf").await_signal("s", escalation=lambda b: b.step("x", lambda o: o)).build()
+        Graph("wf", [AwaitSignal("s", escalation=[Step("x")])]).compile()
 
 
 def test_await_signal_empty_escalation_rejected():
     with pytest.raises(ValueError, match="defines no steps"):
-        Workflow("wf").await_signal("s", timeout_s=5, escalation=lambda b: b).build()
+        Graph("wf", [AwaitSignal("s", timeout_s=5, escalation=[])]).compile()
 
 
 # ---------------------------------------------------------------- fork / join
 
 def test_fork_creates_fork_and_join_with_expected():
-    bp = (Workflow("wf")
-          .fork(
-              Branch.of("l", lambda b: b.step("l1", lambda o: o)),
-              Branch.of("r", lambda b: b.step("r1", lambda o: o).step("r2", lambda o: o)))
-          .step("after", lambda o: o)
-          .build())
+    bp = Graph("wf", [
+        Fork([
+            Branch("l", [Step("l1")]),
+            Branch("r", [Step("r1"), Step("r2")]),
+        ]),
+        Step("after"),
+    ]).compile()
     fork = _kind(bp, "FORK")[0]
     join = _kind(bp, "JOIN")[0]
     byid = _by_id(bp)
@@ -179,16 +197,16 @@ def test_fork_creates_fork_and_join_with_expected():
 
 def test_fork_requires_two_branches():
     with pytest.raises(ValueError):
-        Workflow("wf").fork(Branch.of("only", lambda b: b.step("x", lambda o: o))).build()
+        Graph("wf", [Fork([Branch("only", [Step("x")])])]).compile()
 
 
 # ---------------------------------------------------------------- forkEach (dynamic)
 
 def test_fork_each_dynfork_and_dynamic_join():
-    bp = (Workflow("wf")
-          .fork_each("each", "items", "item", lambda b: b.step("price", lambda o: o))
-          .step("sum", lambda o: o)
-          .build())
+    bp = Graph("wf", [
+        ForkEach("each", over="items", as_="item", body=[Step("price")]),
+        Step("sum"),
+    ]).compile()
     df = _kind(bp, "DYN_FORK")[0]
     join = _kind(bp, "JOIN")[0]
     assert df["itemsKey"] == "items" and df["itemKey"] == "item"
@@ -199,13 +217,14 @@ def test_fork_each_dynfork_and_dynamic_join():
 # ---------------------------------------------------------------- choose
 
 def test_choose_guard_cascade_with_otherwise():
-    bp = (Workflow("wf")
-          .choose(
-              Case.when("vip", lambda o: o.get("vip"), lambda b: b.step("v", lambda o: o)),
-              Case.when("big", lambda o: o.get("big"), lambda b: b.step("g", lambda o: o)),
-              Case.otherwise("std", lambda b: b.step("s", lambda o: o)))
-          .step("after", lambda o: o)
-          .build())
+    bp = Graph("wf", [
+        Choose([
+            Case(when="vip", then=[Step("v")]),
+            Case(when="big", then=[Step("g")]),
+            Case(then=[Step("s")]),          # no `when` -> the otherwise case (must be last)
+        ]),
+        Step("after"),
+    ]).compile()
     byid = _by_id(bp)
     vip = next(n for n in byid.values() if n.get("name") == "vip")
     big = next(n for n in byid.values() if n.get("name") == "big")
@@ -218,18 +237,19 @@ def test_choose_guard_cascade_with_otherwise():
 
 def test_choose_rejects_otherwise_not_last():
     with pytest.raises(ValueError):
-        (Workflow("wf").choose(
-            Case.otherwise("std", lambda b: b.step("s", lambda o: o)),
-            Case.when("vip", lambda o: True, lambda b: b.step("v", lambda o: o))).build())
+        Graph("wf", [Choose([
+            Case(then=[Step("s")]),                # otherwise first -> invalid
+            Case(when="vip", then=[Step("v")]),
+        ])]).compile()
 
 
 # ---------------------------------------------------------------- do_while
 
 def test_do_while_is_a_cycle():
-    bp = (Workflow("wf")
-          .do_while("again", lambda o: o.get("more"), lambda b: b.step("body", lambda o: o))
-          .step("done", lambda o: o)
-          .build())
+    bp = Graph("wf", [
+        DoWhile(while_="again", body=[Step("body")]),
+        Step("done"),
+    ]).compile()
     byid = _by_id(bp)
     cond = next(n for n in byid.values() if n.get("name") == "again")
     body = next(n for n in byid.values() if n.get("name") == "body")
@@ -240,24 +260,25 @@ def test_do_while_is_a_cycle():
 
 # ---------------------------------------------------------------- sub-workflow
 
-def test_sub_workflow_carries_child_name_and_has_no_handler():
-    child = Workflow("child").step("x", lambda o: o).build()
-    bp = (Workflow("parent")
-          .step("prep", lambda o: o)
-          .sub_workflow("call", child)         # accepts a Blueprint
-          .build())
+def test_sub_workflow_carries_child_name():
+    child = Graph("child", [Step("x")]).compile()
+    bp = Graph("parent", [
+        Step("prep"),
+        SubWorkflow("call", child),          # accepts a Blueprint
+    ]).compile()
     sub = _kind(bp, "SUB_WORKFLOW")[0]
     assert sub["activity"] == "child" and sub["name"] == "call"
-    assert "parent#call" not in bp.handlers
+    assert "activity" in sub and sub["name"] == "call"
     # also accepts a bare workflow name
-    assert _kind(Workflow("p2").sub_workflow("c", "child").build(), "SUB_WORKFLOW")[0]["activity"] == "child"
+    by_name = Graph("p2", [SubWorkflow("c", "child")]).compile()
+    assert _kind(by_name, "SUB_WORKFLOW")[0]["activity"] == "child"
 
 
 # ---------------------------------------------------------------- validation
 
 def test_duplicate_step_name_rejected():
     with pytest.raises(ValueError):
-        Workflow("wf").step("a", lambda o: o).step("a", lambda o: o).build()
+        Graph("wf", [Step("a"), Step("a")]).compile()
 
 
 # ---------------------------------------------------------------- conversions
