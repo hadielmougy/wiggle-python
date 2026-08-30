@@ -39,57 +39,57 @@ class CellCoordinatorStub:
             channel: A grpc.Channel.
         """
         self.FetchConfig = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/FetchConfig',
+                '/com.wiggle.proto.CellCoordinator/FetchConfig',
                 request_serializer=coordinator__pb2.FetchConfigRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.NodeConfig.FromString,
                 _registered_method=True)
         self.Register = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/Register',
+                '/com.wiggle.proto.CellCoordinator/Register',
                 request_serializer=coordinator__pb2.RegisterRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.RegisterResponse.FromString,
                 _registered_method=True)
         self.Heartbeat = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/Heartbeat',
+                '/com.wiggle.proto.CellCoordinator/Heartbeat',
                 request_serializer=coordinator__pb2.CoordinatorHeartbeatRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.CoordinatorHeartbeatResponse.FromString,
                 _registered_method=True)
         self.Deregister = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/Deregister',
+                '/com.wiggle.proto.CellCoordinator/Deregister',
                 request_serializer=coordinator__pb2.DeregisterRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.Empty.FromString,
                 _registered_method=True)
         self.Resolve = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/Resolve',
+                '/com.wiggle.proto.CellCoordinator/Resolve',
                 request_serializer=coordinator__pb2.ResolveRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.ResolveResponse.FromString,
                 _registered_method=True)
         self.ActiveCells = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/ActiveCells',
+                '/com.wiggle.proto.CellCoordinator/ActiveCells',
                 request_serializer=coordinator__pb2.ActiveCellsRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.ActiveCellsResponse.FromString,
                 _registered_method=True)
         self.OpenEpoch = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/OpenEpoch',
+                '/com.wiggle.proto.CellCoordinator/OpenEpoch',
                 request_serializer=coordinator__pb2.OpenEpochRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.Policy.FromString,
                 _registered_method=True)
         self.SetRing = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/SetRing',
+                '/com.wiggle.proto.CellCoordinator/SetRing',
                 request_serializer=coordinator__pb2.SetRingRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.Policy.FromString,
                 _registered_method=True)
         self.RegisterWorkflow = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/RegisterWorkflow',
+                '/com.wiggle.proto.CellCoordinator/RegisterWorkflow',
                 request_serializer=coordinator__pb2.RegisterWorkflowRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.RegisterWorkflowResponse.FromString,
                 _registered_method=True)
         self.DeregisterWorkflow = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/DeregisterWorkflow',
+                '/com.wiggle.proto.CellCoordinator/DeregisterWorkflow',
                 request_serializer=coordinator__pb2.DeregisterWorkflowRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.DeregisterWorkflowResponse.FromString,
                 _registered_method=True)
         self.ListWorkflows = channel.unary_unary(
-                '/dev.wiggle.proto.CellCoordinator/ListWorkflows',
+                '/com.wiggle.proto.CellCoordinator/ListWorkflows',
                 request_serializer=coordinator__pb2.ListWorkflowsRequest.SerializeToString,
                 response_deserializer=coordinator__pb2.ListWorkflowsResponse.FromString,
                 _registered_method=True)
@@ -231,9 +231,9 @@ def add_CellCoordinatorServicer_to_server(servicer, server):
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'dev.wiggle.proto.CellCoordinator', rpc_method_handlers)
+            'com.wiggle.proto.CellCoordinator', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('dev.wiggle.proto.CellCoordinator', rpc_method_handlers)
+    server.add_registered_method_handlers('com.wiggle.proto.CellCoordinator', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -257,7 +257,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/FetchConfig',
+            '/com.wiggle.proto.CellCoordinator/FetchConfig',
             coordinator__pb2.FetchConfigRequest.SerializeToString,
             coordinator__pb2.NodeConfig.FromString,
             options,
@@ -284,7 +284,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/Register',
+            '/com.wiggle.proto.CellCoordinator/Register',
             coordinator__pb2.RegisterRequest.SerializeToString,
             coordinator__pb2.RegisterResponse.FromString,
             options,
@@ -311,7 +311,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/Heartbeat',
+            '/com.wiggle.proto.CellCoordinator/Heartbeat',
             coordinator__pb2.CoordinatorHeartbeatRequest.SerializeToString,
             coordinator__pb2.CoordinatorHeartbeatResponse.FromString,
             options,
@@ -338,7 +338,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/Deregister',
+            '/com.wiggle.proto.CellCoordinator/Deregister',
             coordinator__pb2.DeregisterRequest.SerializeToString,
             wiggle__pb2.Empty.FromString,
             options,
@@ -365,7 +365,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/Resolve',
+            '/com.wiggle.proto.CellCoordinator/Resolve',
             coordinator__pb2.ResolveRequest.SerializeToString,
             coordinator__pb2.ResolveResponse.FromString,
             options,
@@ -392,7 +392,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/ActiveCells',
+            '/com.wiggle.proto.CellCoordinator/ActiveCells',
             coordinator__pb2.ActiveCellsRequest.SerializeToString,
             coordinator__pb2.ActiveCellsResponse.FromString,
             options,
@@ -419,7 +419,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/OpenEpoch',
+            '/com.wiggle.proto.CellCoordinator/OpenEpoch',
             coordinator__pb2.OpenEpochRequest.SerializeToString,
             coordinator__pb2.Policy.FromString,
             options,
@@ -446,7 +446,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/SetRing',
+            '/com.wiggle.proto.CellCoordinator/SetRing',
             coordinator__pb2.SetRingRequest.SerializeToString,
             coordinator__pb2.Policy.FromString,
             options,
@@ -473,7 +473,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/RegisterWorkflow',
+            '/com.wiggle.proto.CellCoordinator/RegisterWorkflow',
             coordinator__pb2.RegisterWorkflowRequest.SerializeToString,
             coordinator__pb2.RegisterWorkflowResponse.FromString,
             options,
@@ -500,7 +500,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/DeregisterWorkflow',
+            '/com.wiggle.proto.CellCoordinator/DeregisterWorkflow',
             coordinator__pb2.DeregisterWorkflowRequest.SerializeToString,
             coordinator__pb2.DeregisterWorkflowResponse.FromString,
             options,
@@ -527,7 +527,7 @@ class CellCoordinator:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.CellCoordinator/ListWorkflows',
+            '/com.wiggle.proto.CellCoordinator/ListWorkflows',
             coordinator__pb2.ListWorkflowsRequest.SerializeToString,
             coordinator__pb2.ListWorkflowsResponse.FromString,
             options,

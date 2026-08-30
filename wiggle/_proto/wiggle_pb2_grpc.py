@@ -37,92 +37,92 @@ class WiggleControlPlaneStub:
             channel: A grpc.Channel.
         """
         self.HealthCheck = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/HealthCheck',
+                '/com.wiggle.proto.WiggleControlPlane/HealthCheck',
                 request_serializer=wiggle__pb2.Empty.SerializeToString,
                 response_deserializer=wiggle__pb2.HealthStatus.FromString,
                 _registered_method=True)
         self.GetCluster = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/GetCluster',
+                '/com.wiggle.proto.WiggleControlPlane/GetCluster',
                 request_serializer=wiggle__pb2.Empty.SerializeToString,
                 response_deserializer=wiggle__pb2.ClusterView.FromString,
                 _registered_method=True)
         self.ListWorkflows = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/ListWorkflows',
+                '/com.wiggle.proto.WiggleControlPlane/ListWorkflows',
                 request_serializer=wiggle__pb2.Empty.SerializeToString,
                 response_deserializer=wiggle__pb2.WorkflowNames.FromString,
                 _registered_method=True)
         self.RegisterWorkflow = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/RegisterWorkflow',
+                '/com.wiggle.proto.WiggleControlPlane/RegisterWorkflow',
                 request_serializer=wiggle__pb2.WorkflowDefinition.SerializeToString,
                 response_deserializer=wiggle__pb2.RegisterWorkflowResult.FromString,
                 _registered_method=True)
         self.GetWorkflow = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/GetWorkflow',
+                '/com.wiggle.proto.WiggleControlPlane/GetWorkflow',
                 request_serializer=wiggle__pb2.GetWorkflowRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.WorkflowDefinition.FromString,
                 _registered_method=True)
         self.StartInstance = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/StartInstance',
+                '/com.wiggle.proto.WiggleControlPlane/StartInstance',
                 request_serializer=wiggle__pb2.StartInstanceRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.StartInstanceResult.FromString,
                 _registered_method=True)
         self.ListInstances = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/ListInstances',
+                '/com.wiggle.proto.WiggleControlPlane/ListInstances',
                 request_serializer=wiggle__pb2.ListInstancesRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.InstanceList.FromString,
                 _registered_method=True)
         self.GetInstance = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/GetInstance',
+                '/com.wiggle.proto.WiggleControlPlane/GetInstance',
                 request_serializer=wiggle__pb2.InstanceIdRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.InstanceDetail.FromString,
                 _registered_method=True)
         self.CancelInstance = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/CancelInstance',
+                '/com.wiggle.proto.WiggleControlPlane/CancelInstance',
                 request_serializer=wiggle__pb2.CancelInstanceRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.CancelInstanceResult.FromString,
                 _registered_method=True)
         self.SignalInstance = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/SignalInstance',
+                '/com.wiggle.proto.WiggleControlPlane/SignalInstance',
                 request_serializer=wiggle__pb2.SignalRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.Ack.FromString,
                 _registered_method=True)
         self.CreateSchedule = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/CreateSchedule',
+                '/com.wiggle.proto.WiggleControlPlane/CreateSchedule',
                 request_serializer=wiggle__pb2.CreateScheduleRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.ScheduleView.FromString,
                 _registered_method=True)
         self.ListSchedules = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/ListSchedules',
+                '/com.wiggle.proto.WiggleControlPlane/ListSchedules',
                 request_serializer=wiggle__pb2.Empty.SerializeToString,
                 response_deserializer=wiggle__pb2.ScheduleList.FromString,
                 _registered_method=True)
         self.DeleteSchedule = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/DeleteSchedule',
+                '/com.wiggle.proto.WiggleControlPlane/DeleteSchedule',
                 request_serializer=wiggle__pb2.ScheduleIdRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.Ack.FromString,
                 _registered_method=True)
         self.PollTasks = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/PollTasks',
+                '/com.wiggle.proto.WiggleControlPlane/PollTasks',
                 request_serializer=wiggle__pb2.PollRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.TaskList.FromString,
                 _registered_method=True)
         self.CompleteTask = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/CompleteTask',
+                '/com.wiggle.proto.WiggleControlPlane/CompleteTask',
                 request_serializer=wiggle__pb2.TaskResultRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.Ack.FromString,
                 _registered_method=True)
         self.FailTask = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/FailTask',
+                '/com.wiggle.proto.WiggleControlPlane/FailTask',
                 request_serializer=wiggle__pb2.TaskFailureRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.Ack.FromString,
                 _registered_method=True)
         self.HeartbeatTask = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/HeartbeatTask',
+                '/com.wiggle.proto.WiggleControlPlane/HeartbeatTask',
                 request_serializer=wiggle__pb2.HeartbeatRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.HeartbeatResult.FromString,
                 _registered_method=True)
         self.AdvanceRun = channel.unary_unary(
-                '/dev.wiggle.proto.WiggleControlPlane/AdvanceRun',
+                '/com.wiggle.proto.WiggleControlPlane/AdvanceRun',
                 request_serializer=wiggle__pb2.AdvanceRunRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.AdvanceRunResult.FromString,
                 _registered_method=True)
@@ -339,9 +339,9 @@ def add_WiggleControlPlaneServicer_to_server(servicer, server):
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'dev.wiggle.proto.WiggleControlPlane', rpc_method_handlers)
+            'com.wiggle.proto.WiggleControlPlane', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('dev.wiggle.proto.WiggleControlPlane', rpc_method_handlers)
+    server.add_registered_method_handlers('com.wiggle.proto.WiggleControlPlane', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -364,7 +364,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/HealthCheck',
+            '/com.wiggle.proto.WiggleControlPlane/HealthCheck',
             wiggle__pb2.Empty.SerializeToString,
             wiggle__pb2.HealthStatus.FromString,
             options,
@@ -391,7 +391,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/GetCluster',
+            '/com.wiggle.proto.WiggleControlPlane/GetCluster',
             wiggle__pb2.Empty.SerializeToString,
             wiggle__pb2.ClusterView.FromString,
             options,
@@ -418,7 +418,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/ListWorkflows',
+            '/com.wiggle.proto.WiggleControlPlane/ListWorkflows',
             wiggle__pb2.Empty.SerializeToString,
             wiggle__pb2.WorkflowNames.FromString,
             options,
@@ -445,7 +445,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/RegisterWorkflow',
+            '/com.wiggle.proto.WiggleControlPlane/RegisterWorkflow',
             wiggle__pb2.WorkflowDefinition.SerializeToString,
             wiggle__pb2.RegisterWorkflowResult.FromString,
             options,
@@ -472,7 +472,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/GetWorkflow',
+            '/com.wiggle.proto.WiggleControlPlane/GetWorkflow',
             wiggle__pb2.GetWorkflowRequest.SerializeToString,
             wiggle__pb2.WorkflowDefinition.FromString,
             options,
@@ -499,7 +499,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/StartInstance',
+            '/com.wiggle.proto.WiggleControlPlane/StartInstance',
             wiggle__pb2.StartInstanceRequest.SerializeToString,
             wiggle__pb2.StartInstanceResult.FromString,
             options,
@@ -526,7 +526,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/ListInstances',
+            '/com.wiggle.proto.WiggleControlPlane/ListInstances',
             wiggle__pb2.ListInstancesRequest.SerializeToString,
             wiggle__pb2.InstanceList.FromString,
             options,
@@ -553,7 +553,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/GetInstance',
+            '/com.wiggle.proto.WiggleControlPlane/GetInstance',
             wiggle__pb2.InstanceIdRequest.SerializeToString,
             wiggle__pb2.InstanceDetail.FromString,
             options,
@@ -580,7 +580,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/CancelInstance',
+            '/com.wiggle.proto.WiggleControlPlane/CancelInstance',
             wiggle__pb2.CancelInstanceRequest.SerializeToString,
             wiggle__pb2.CancelInstanceResult.FromString,
             options,
@@ -607,7 +607,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/SignalInstance',
+            '/com.wiggle.proto.WiggleControlPlane/SignalInstance',
             wiggle__pb2.SignalRequest.SerializeToString,
             wiggle__pb2.Ack.FromString,
             options,
@@ -634,7 +634,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/CreateSchedule',
+            '/com.wiggle.proto.WiggleControlPlane/CreateSchedule',
             wiggle__pb2.CreateScheduleRequest.SerializeToString,
             wiggle__pb2.ScheduleView.FromString,
             options,
@@ -661,7 +661,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/ListSchedules',
+            '/com.wiggle.proto.WiggleControlPlane/ListSchedules',
             wiggle__pb2.Empty.SerializeToString,
             wiggle__pb2.ScheduleList.FromString,
             options,
@@ -688,7 +688,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/DeleteSchedule',
+            '/com.wiggle.proto.WiggleControlPlane/DeleteSchedule',
             wiggle__pb2.ScheduleIdRequest.SerializeToString,
             wiggle__pb2.Ack.FromString,
             options,
@@ -715,7 +715,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/PollTasks',
+            '/com.wiggle.proto.WiggleControlPlane/PollTasks',
             wiggle__pb2.PollRequest.SerializeToString,
             wiggle__pb2.TaskList.FromString,
             options,
@@ -742,7 +742,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/CompleteTask',
+            '/com.wiggle.proto.WiggleControlPlane/CompleteTask',
             wiggle__pb2.TaskResultRequest.SerializeToString,
             wiggle__pb2.Ack.FromString,
             options,
@@ -769,7 +769,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/FailTask',
+            '/com.wiggle.proto.WiggleControlPlane/FailTask',
             wiggle__pb2.TaskFailureRequest.SerializeToString,
             wiggle__pb2.Ack.FromString,
             options,
@@ -796,7 +796,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/HeartbeatTask',
+            '/com.wiggle.proto.WiggleControlPlane/HeartbeatTask',
             wiggle__pb2.HeartbeatRequest.SerializeToString,
             wiggle__pb2.HeartbeatResult.FromString,
             options,
@@ -823,7 +823,7 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dev.wiggle.proto.WiggleControlPlane/AdvanceRun',
+            '/com.wiggle.proto.WiggleControlPlane/AdvanceRun',
             wiggle__pb2.AdvanceRunRequest.SerializeToString,
             wiggle__pb2.AdvanceRunResult.FromString,
             options,
