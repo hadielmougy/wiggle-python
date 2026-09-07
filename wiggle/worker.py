@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterable, Optional
 
 import grpc
 
-from ._convert import from_value, shallow_diff
+from ._convert import from_value
 from .client import WiggleClient
 from .workflow import Activity, Predicate, SideEffect
 
@@ -148,12 +148,11 @@ class Worker:
     def handle(self, workflow: str, step: str, fn: Activity) -> "Worker":
         """Bind a handler to one step of an already-registered workflow, by name -- no topology
         re-declaration. The graph lives on the server; this worker just implements ``step``. ``fn``
-        takes the context and returns the new context (only what changed is sent back), exactly like
-        :meth:`Workflow.step`. Which queue the step polls is discovered from the graph on
+        takes the context and returns the new context — sent whole, it REPLACES the previous
+        context server-side (no diff, no merge; ``None`` leaves it untouched). Which queue the step polls is discovered from the graph on
         :meth:`start`, which also fails fast if ``step`` does not exist (or is the wrong kind)."""
         def wrapper(ctx):
-            out = fn(ctx)
-            return shallow_diff(ctx, out) if out is not None else None
+            return fn(ctx)
         return self._bind(workflow, step, "TASK", wrapper)
 
     def handle_combine(self, workflow: str, step: str, fn: Activity) -> "Worker":
@@ -355,8 +354,9 @@ class Worker:
             return effect_wrapper
 
         def task_wrapper(ctx):
-            out = method(ctx)
-            return shallow_diff(ctx, out) if out is not None else None
+            # The return is the step's COMPLETE next context: sent whole, it replaces the
+            # previous value server-side (None leaves it untouched).
+            return method(ctx)
         return task_wrapper
 
     def _fetch_graph(self, workflow: str) -> dict:

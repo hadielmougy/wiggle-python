@@ -112,11 +112,12 @@ def test_duplicate_binding_rejected():
 
 # ---------------------------------------------------------------- wrapper semantics
 
-def test_handle_wrapper_sends_only_the_diff():
+def test_handle_wrapper_sends_the_whole_return():
+    # The return REPLACES the context server-side, so the whole return goes on the wire.
     w = _worker({"order-fulfilment": _graph()})
     w.handle("order-fulfilment", "authorise", lambda o: {**o, "paid": True})
     wrapper = w._handlers["order-fulfilment#authorise"]
-    assert wrapper({"orderId": "o1", "qty": 1}) == {"paid": True}   # unchanged keys are not resent
+    assert wrapper({"orderId": "o1", "qty": 1}) == {"orderId": "o1", "qty": 1, "paid": True}
 
 
 def test_handle_effect_wrapper_returns_none():
@@ -176,8 +177,9 @@ def test_register_handlers_matches_by_name_and_binds_all_kinds():
     # gate wrapper -> bool
     assert handlers["order-fulfilment#in-stock"]({"qty": 2}) is True
     assert handlers["order-fulfilment#in-stock"]({"qty": 0}) is False
-    # task wrapper -> only the diff
-    assert handlers["order-fulfilment#authorise"]({"orderId": "o1", "qty": 1}) == {"paid": True}
+    # task wrapper -> the WHOLE next context (it replaces server-side)
+    assert handlers["order-fulfilment#authorise"]({"orderId": "o1", "qty": 1}) == {
+        "orderId": "o1", "qty": 1, "paid": True}
     # effect wrapper -> None (context unchanged on the wire)
     assert handlers["order-fulfilment#audit"]({"orderId": "o1"}) is None
     # queue discovered from the graph

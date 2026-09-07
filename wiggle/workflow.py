@@ -166,16 +166,21 @@ class Fork(Node):
 
 
 @dataclass
-class ForkEach(Node):
-    """Runtime fan-out: at run time the engine reads the list in the context at ``over`` and spawns one
-    parallel branch per element, running ``body`` with that element injected under ``as_`` (and its
-    index under ``as_ + "Index"``), branch-scoped. All branches join before the flow continues; an
-    empty or missing list skips straight through."""
+class ForEach(Node):
+    """Runtime fan-out: at run time the engine reads the collection in the context at ``over`` (a
+    list or a map) and spawns one parallel branch per element, each on its own ISOLATED copy of the
+    context with the element injected under ``as_`` (its index under ``as_ + "Index"`` and, for a
+    map, its key under ``as_ + "Key"``). Item writes never touch the shared context. ``combine``
+    names the MANDATORY merge step: its handler receives the context with every item's final
+    context collected under ``name`` — a list ordered by item index for a list input, a map keyed
+    like the input for a map input — and must return the COMPLETE post-join context (the engine
+    replaces the context with it). An empty collection skips the body and the combine."""
 
     name: str
-    over: str                # itemsKey: the context key holding the list
+    over: str                # itemsKey: the context key holding the collection
     as_: str                 # itemKey: each element is injected under this key
     body: list["Node"]
+    combine: str = ""
 
 
 @dataclass
@@ -327,6 +332,14 @@ class _Graph:
         self.nodes[nid]["itemsKey"] = json.dumps(arms, separators=(",", ":"))
         return nid
 
+    def add_for_each_combine(self, name: str, scratch_key: str) -> str:
+        """The mandatory merge node after a forEach's join: a TASK bound by name whose ``itemsKey``
+        is a JSON STRING (the scratch key the engine stages the collected item results under) —
+        versus a fork combine's arm-name array."""
+        nid = self.add_worker("TASK", name, None, None)
+        self.nodes[nid]["itemsKey"] = json.dumps(scratch_key)
+        return nid
+
     def add_join(self, expected: int) -> str:
         nid = self._nid("join")
         node = {"id": nid, "kind": "JOIN", "name": nid}
@@ -407,8 +420,8 @@ class _Builder:
             self.chain(self.g.add_subworkflow(n.name, _child_name(n.workflow)))
         elif isinstance(n, Fork):
             self._append_fork(n)
-        elif isinstance(n, ForkEach):
-            self._append_fork_each(n)
+        elif isinstance(n, ForEach):
+            self._append_for_each(n)
         elif isinstance(n, Choose):
             self._append_choose(n)
         elif isinstance(n, DoWhile):
@@ -448,14 +461,19 @@ class _Builder:
         self.g.wire(join_id, "next", combine_id)
         self.open = [(combine_id, "next")]
 
-    def _append_fork_each(self, n: ForkEach) -> None:
+    def _append_for_each(self, n: ForEach) -> None:
+        if not n.combine:
+            raise ValueError("for_each needs a combine step name (ForEach(..., combine=...)): item "
+                             "results rejoin at an explicit merge handler; there is no implicit fold")
         fork_id = self.g.add_dynfork(n.name, n.over, n.as_)
         self.attach(fork_id)
         join_id = self.g.add_join(0)                          # 0 = dynamic width
         template_start = self._build_branch(Branch(n.name, n.body), join_id)
         self.g.set_branches(fork_id, [template_start])
-        self.g.wire(fork_id, "next", join_id)                 # followed directly when the list is empty
-        self.open = [(join_id, "next")]
+        self.g.wire(fork_id, "next", join_id)   # empty-collection skip (past the combine, engine-side)
+        combine_id = self.g.add_for_each_combine(n.combine, n.name)
+        self.g.wire(join_id, "next", combine_id)
+        self.open = [(combine_id, "next")]
 
     def _append_do_while(self, n: DoWhile) -> None:
         sub = self.sub(self.enclosing_join)

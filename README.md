@@ -72,7 +72,7 @@ register. Handlers are **not** part of the topology — a worker binds them sepa
 | `Effect(name, queue=None, retry=None)` | a side-effect step (`handle_effect`); context unchanged |
 | `Gate(name, queue=None, retry=None)` | a predicate (`handle_gate`); false ends the instance as `gated:<name>` |
 | `Fork([Branch(name, steps), …], combine=…)` | run branches **in parallel** on isolated context copies, then rejoin at the **mandatory** `combine` step (`handle_combine`) — no implicit fold; needs ≥ 2 |
-| `ForkEach(name, over, as_, body)` | runtime fan-out: one parallel branch per element of the list at `over` (bound to `as_`) |
+| `ForEach(name, over, as_, body, combine=…)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `over` (bound to `as_`); the **mandatory** `combine` handler receives every item's final context collected under `name` and returns the complete post-join context |
 | `Choose([Case(when, then), …, Case(then)])` | exclusive choice: the first `Case` whose `when` guard holds runs; a `Case` with no `when` is the otherwise (last) |
 | `DoWhile(while_, body)` | run `body`, then repeat while the `while_` predicate holds (body runs at least once) |
 | `SubWorkflow(name, workflow)` | run another workflow (a `Blueprint`, `Graph`, or name) as a child; its result merges back |
@@ -115,26 +115,34 @@ wf = Graph("order", [
 Branches touching different fields merge cleanly; if two write the same key, the later write wins.
 A `Gate` inside a branch short-circuits to that fork's join (not the whole instance).
 
-Runtime fan-out spawns one branch per list element, each seeing its element (and index):
+Runtime fan-out spawns one ISOLATED branch per element (list or map), each seeing its element:
 
 ```python
 wf = Graph("charge", [
-    ForkEach("charge-items", over="items", as_="item", body=[
-        Step("price"),   # a handler sees o["item"] and o["itemIndex"]
-    ]),
+    ForEach("charge-items", over="items", as_="item", body=[
+        Step("price"),   # a handler sees o["item"] (and o["itemIndex"]); item writes stay isolated
+    ], combine="collect"),
     Step("summarise"),
 ]).compile()
-# start(wf, {"items": [1, 2, 3]}) -> one branch per item ; an empty/missing list skips straight through
+# start(wf, {"items": [1, 2, 3]}) -> one branch per item; empty/missing skips the body AND the combine
+
+def collect(ctx):
+    items = ctx.pop("charge-items")          # every item's final context, collected by the engine:
+    ctx["prices"] = [i["price"] for i in items]  # a list for a list input, a map for a map input
+    return ctx                                # the COMPLETE post-join context — it replaces
+
+worker.handle_combine("charge", "collect", collect)
 ```
 
-Branches share one context, so put per-element results under per-element keys (use the index).
+Item writes never touch the shared context — no index-namespacing needed; the combine assembles
+the final shape explicitly.
 
 Per-step `queue` defaults to `default_queue` (a `Graph` field), else the workflow name. Retry policies:
 `Retry.exponential(attempts, initial_s)`, `Retry.fixed(attempts, backoff_s)`, `Retry.none()`,
 `Retry.forever()`. Raise `wiggle.PermanentError` from a handler to fail a step **without** retrying.
 
 The node set —
-`Step`/`Gate`/`Effect`/`Fork`/`ForkEach`/`Choose`/`DoWhile`/`SubWorkflow`/`Sleep`/`AwaitSignal` —
+`Step`/`Gate`/`Effect`/`Fork`/`ForEach`/`Choose`/`DoWhile`/`SubWorkflow`/`Sleep`/`AwaitSignal` —
 matches the Java DSL and the Go client's declarative structs. A `SubWorkflow`'s child must be
 registered separately (`client.register(child)`), and some worker must serve the child's steps too.
 Because dispatch is by activity name (`"<workflow>#<step>"`), Python, Java, and Go workers interoperate:

@@ -53,17 +53,3 @@ def from_value(v: struct_pb2.Value) -> Any:
     raise ValueError(f"unexpected value kind: {kind}")
 
 
-def shallow_diff(before: Any, after: Any) -> Any:
-    """The top-level delta to merge back into the context: changed/added keys, and ``None`` for
-    keys the step dropped. Mirrors the server's merge semantics, so a step returns the *whole*
-    context and only what actually changed is written."""
-    if not isinstance(before, dict) or not isinstance(after, dict):
-        return after
-    delta: dict[str, Any] = {}
-    for k, val in after.items():
-        if before.get(k) != val:
-            delta[k] = val
-    for k in before:
-        if k not in after:
-            delta[k] = None
-    return delta
