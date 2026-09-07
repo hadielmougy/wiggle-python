@@ -83,7 +83,7 @@ def test_version_is_structural_independent_of_node_ids():
     from wiggle.workflow import _content_version
     bp = Graph("wf", [
         Step("a"),
-        Fork([Branch("l", [Step("l1")]), Branch("r", [Step("r1")])]),
+        Fork([Branch("l", [Step("l1")]), Branch("r", [Step("r1")])], combine="merge"),
         Step("z"),
     ]).compile()
     # relabel every node id to a totally different scheme, rewriting all edge references too
@@ -175,12 +175,12 @@ def test_await_signal_empty_escalation_rejected():
 
 # ---------------------------------------------------------------- fork / join
 
-def test_fork_creates_fork_and_join_with_expected():
+def test_fork_creates_fork_join_and_mandatory_combine():
     bp = Graph("wf", [
         Fork([
             Branch("l", [Step("l1")]),
             Branch("r", [Step("r1"), Step("r2")]),
-        ]),
+        ], combine="merge"),
         Step("after"),
     ]).compile()
     fork = _kind(bp, "FORK")[0]
@@ -190,14 +190,24 @@ def test_fork_creates_fork_and_join_with_expected():
     assert join["expected"] == 2
     for start in fork["branches"]:
         assert start in byid                      # branch starts exist
-    # both branch tails lead to the join, and the join continues to "after"
+    # the join flows into the mandatory combine (a TASK carrying the arm names on itemsKey),
+    # and only then into "after" -- there is no implicit fold
+    combine = next(n for n in byid.values() if n.get("name") == "merge")
+    assert combine["kind"] == "TASK"
+    assert combine["itemsKey"] == '["l","r"]'
+    assert join["next"] == combine["id"]
     after = next(n for n in byid.values() if n.get("name") == "after")
-    assert join["next"] == after["id"]
+    assert combine["next"] == after["id"]
 
 
 def test_fork_requires_two_branches():
     with pytest.raises(ValueError):
-        Graph("wf", [Fork([Branch("only", [Step("x")])])]).compile()
+        Graph("wf", [Fork([Branch("only", [Step("x")])], combine="merge")]).compile()
+
+
+def test_fork_requires_a_combine():
+    with pytest.raises(ValueError, match="combine"):
+        Graph("wf", [Fork([Branch("l", [Step("l1")]), Branch("r", [Step("r1")])])]).compile()
 
 
 # ---------------------------------------------------------------- forkEach (dynamic)

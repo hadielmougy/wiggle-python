@@ -71,13 +71,28 @@ register. Handlers are **not** part of the topology — a worker binds them sepa
 | `Step(name, queue=None, retry=None)` | a task run on a worker (`handle`); only changed context keys merge back |
 | `Effect(name, queue=None, retry=None)` | a side-effect step (`handle_effect`); context unchanged |
 | `Gate(name, queue=None, retry=None)` | a predicate (`handle_gate`); false ends the instance as `gated:<name>` |
-| `Fork([Branch(name, steps), …])` | run branches **in parallel**, then wait for all of them (join); needs ≥ 2 |
+| `Fork([Branch(name, steps), …], combine=…)` | run branches **in parallel** on isolated context copies, then rejoin at the **mandatory** `combine` step (`handle_combine`) — no implicit fold; needs ≥ 2 |
 | `ForkEach(name, over, as_, body)` | runtime fan-out: one parallel branch per element of the list at `over` (bound to `as_`) |
 | `Choose([Case(when, then), …, Case(then)])` | exclusive choice: the first `Case` whose `when` guard holds runs; a `Case` with no `when` is the otherwise (last) |
 | `DoWhile(while_, body)` | run `body`, then repeat while the `while_` predicate holds (body runs at least once) |
 | `SubWorkflow(name, workflow)` | run another workflow (a `Blueprint`, `Graph`, or name) as a child; its result merges back |
 | `Sleep(name, seconds=, millis=)` | server-side timer; no worker is held |
 | `AwaitSignal(name, timeout_s=0, escalation=None)` | wait for a signal via `client.signal(...)`; on timeout, fail — or run the `escalation` nodes and rejoin |
+
+A fork's combine is bound with `handle_combine(workflow, step, fn)`: `fn` receives the context with
+each branch's result staged under the branch's name, and must return the **complete** post-join
+context — the engine replaces the context with it, so keys the handler omits do not survive the
+join (there is no implicit union of the arms):
+
+```python
+def merge(ctx):
+    out = {k: v for k, v in ctx.items() if k not in ("payment", "shipping")}  # carry the base
+    out.update(ctx.get("payment") or {})    # fold what each arm produced
+    out.update(ctx.get("shipping") or {})
+    return out
+
+worker.handle_combine("order", "merge", merge)
+```
 
 `Branch(name, steps)`, `Case(when, then)`, and the `body`/`escalation` fields are themselves lists of
 `Node`, so branches and bodies nest arbitrarily:
@@ -88,7 +103,7 @@ wf = Graph("order", [
     Fork([                                                # parallel, joined
         Branch("payment",  [Step("charge")]),
         Branch("shipping", [Step("reserve"), Step("label")]),
-    ]),
+    ], combine="merge"),   # mandatory: branches rejoin at an explicit merge handler (handle_combine)
     Choose([                                              # exactly one arm runs
         Case(when="vip", then=[Step("concierge")]),
         Case(then=[Step("thanks")]),                      # no `when` -> the otherwise case (must be last)

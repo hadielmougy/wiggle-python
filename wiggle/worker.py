@@ -156,6 +156,15 @@ class Worker:
             return shallow_diff(ctx, out) if out is not None else None
         return self._bind(workflow, step, "TASK", wrapper)
 
+    def handle_combine(self, workflow: str, step: str, fn: Activity) -> "Worker":
+        """Bind the mandatory merge step that follows a fork's join. ``fn`` receives the context
+        with each branch's result staged under the branch's name, and must return the COMPLETE
+        post-join context: it is sent verbatim (no diff, no implicit fold) and the engine REPLACES
+        the context with it -- keys ``fn`` omits do not survive the join."""
+        def wrapper(ctx):
+            return fn(ctx)
+        return self._bind(workflow, step, "COMBINE", wrapper)
+
     def handle_gate(self, workflow: str, step: str, test: Predicate) -> "Worker":
         """Bind a predicate (gate / choose guard / do-while condition) step by name; ``test`` returns
         a bool. See :meth:`handle`."""
@@ -263,7 +272,16 @@ class Worker:
                     avail = sorted(a.split("#", 1)[1] for a in nodes)
                     raise ValueError(f"no step '{step}' in registered workflow '{wf}' "
                                      f"(available steps: {avail})")
-                if node["kind"] != kind:
+                is_combine = node["kind"] == "TASK" and node.get("itemsKey")
+                if kind == "COMBINE" and not is_combine:
+                    raise ValueError(f"activity '{activity}' is not a fork combine; bind it with handle()")
+                elif kind == "COMBINE":
+                    pass   # a combine claim on a combine node
+                elif is_combine:
+                    raise ValueError(f"activity '{activity}' is a fork combine; bind it with "
+                                     f"handle_combine() -- its return is the complete post-join "
+                                     f"context (there is no implicit fold)")
+                elif node["kind"] != kind:
                     verb = "handle_gate" if node["kind"] == "PREDICATE" else "handle"
                     raise ValueError(f"activity '{activity}' is a {node['kind']} in the graph but was "
                                      f"bound as {kind}; use {verb}() instead")
@@ -317,6 +335,15 @@ class Worker:
                 raise ValueError(f"activity '{activity}' is a gate (PREDICATE) but handler "
                                  f"'{cand.name}' is annotated to return {ret!r}; a gate must return bool")
             return lambda ctx: bool(method(ctx))
+        if node.get("itemsKey"):
+            # A fork combine: the return is the COMPLETE post-join context, sent verbatim (no
+            # diff) -- the engine replaces the context with it; there is no implicit fold.
+            if ret is bool or ret is None:
+                raise ValueError(f"activity '{activity}' is a fork combine; handler '{cand.name}' "
+                                 f"must return the complete post-join context (a dict), not {ret!r}")
+            def combine_wrapper(ctx):
+                return method(ctx)
+            return combine_wrapper
         # TASK node: task unless the method is a declared side effect (-> None), a bool is a mistake here
         if ret is bool:
             raise ValueError(f"activity '{activity}' is a TASK but handler '{cand.name}' is annotated "

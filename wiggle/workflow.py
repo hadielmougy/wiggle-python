@@ -153,9 +153,16 @@ class Branch:
 
 @dataclass
 class Fork(Node):
-    """Fan out into parallel branches and wait for all of them (join). Needs >= 2 branches."""
+    """Fan out into parallel branches and wait for all of them (join). Needs >= 2 branches.
+
+    ``combine`` names the MANDATORY merge step run after the join: its handler receives the context
+    with each branch's result staged under the branch's name, and must return the COMPLETE
+    post-join context -- the engine replaces the context with it, so keys the handler omits do not
+    survive the join. There is no implicit fold of the arms. Bind it with
+    :meth:`wiggle.worker.Worker.handle_combine` (or a :class:`Handlers` method matched by name)."""
 
     branches: list[Branch]
+    combine: str = ""
 
 
 @dataclass
@@ -312,6 +319,14 @@ class _Graph:
                            "itemsKey": items_key, "itemKey": item_key}
         return nid
 
+    def add_combine(self, name: str, arms: list[str]) -> str:
+        """The mandatory merge node after a fork's join: a TASK bound by name like any step, carrying
+        the fork's arm names (a JSON array) on its ``itemsKey`` so the engine can stage each isolated
+        branch's result under its name for the handler, and strip those keys afterward."""
+        nid = self.add_worker("TASK", name, None, None)
+        self.nodes[nid]["itemsKey"] = json.dumps(arms, separators=(",", ":"))
+        return nid
+
     def add_join(self, expected: int) -> str:
         nid = self._nid("join")
         node = {"id": nid, "kind": "JOIN", "name": nid}
@@ -421,12 +436,17 @@ class _Builder:
     def _append_fork(self, n: Fork) -> None:
         if len(n.branches) < 2:
             raise ValueError("fork needs at least two branches")
+        if not n.combine:
+            raise ValueError("fork needs a combine step name (Fork(..., combine=...)): branches "
+                             "rejoin at an explicit merge handler; there is no implicit fold")
         fork_id = self.g.add_fork()
         self.attach(fork_id)
         join_id = self.g.add_join(len(n.branches))
         starts = [self._build_branch(b, join_id) for b in n.branches]
         self.g.set_branches(fork_id, starts)
-        self.open = [(join_id, "next")]
+        combine_id = self.g.add_combine(n.combine, [b.name for b in n.branches])
+        self.g.wire(join_id, "next", combine_id)
+        self.open = [(combine_id, "next")]
 
     def _append_fork_each(self, n: ForkEach) -> None:
         fork_id = self.g.add_dynfork(n.name, n.over, n.as_)
