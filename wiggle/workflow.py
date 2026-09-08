@@ -178,7 +178,6 @@ class ForEach(Node):
 
     name: str
     over: str                # itemsKey: the context key holding the collection
-    as_: str                 # itemKey: each element is injected under this key
     body: list["Node"]
     combine: str = ""
 
@@ -465,7 +464,7 @@ class _Builder:
         if not n.combine:
             raise ValueError("for_each needs a combine step name (ForEach(..., combine=...)): item "
                              "results rejoin at an explicit merge handler; there is no implicit fold")
-        fork_id = self.g.add_dynfork(n.name, n.over, n.as_)
+        fork_id = self.g.add_dynfork(n.name, n.over, n.over)
         self.attach(fork_id)
         join_id = self.g.add_join(0)                          # 0 = dynamic width
         template_start = self._build_branch(Branch(n.name, n.body), join_id)

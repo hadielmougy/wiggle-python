@@ -214,13 +214,13 @@ def test_fork_requires_a_combine():
 
 def test_for_each_dynfork_join_and_mandatory_combine():
     bp = Graph("wf", [
-        ForEach("each", over="items", as_="item", body=[Step("price")], combine="collect"),
+        ForEach("each", over="items", body=[Step("price")], combine="collect"),
         Step("sum"),
     ]).compile()
     df = _kind(bp, "DYN_FORK")[0]
     join = _kind(bp, "JOIN")[0]
     byid = _by_id(bp)
-    assert df["itemsKey"] == "items" and df["itemKey"] == "item"
+    assert df["itemsKey"] == "items"   # the element is the item's context; no itemKey injection
     assert df["branches"] and df["next"] == join["id"]      # empty-collection skip -> join
     assert "expected" not in join                           # dynamic width, not a fixed count
     # the join flows into the mandatory combine, whose itemsKey is a JSON STRING (the scratch key
@@ -233,7 +233,7 @@ def test_for_each_dynfork_join_and_mandatory_combine():
 
 def test_for_each_requires_a_combine():
     with pytest.raises(ValueError, match="combine"):
-        Graph("wf", [ForEach("each", over="items", as_="item", body=[Step("price")])]).compile()
+        Graph("wf", [ForEach("each", over="items", body=[Step("price")])]).compile()
 
 
 # ---------------------------------------------------------------- choose

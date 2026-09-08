@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Optional
 import grpc
 
 from ._convert import from_value
+from . import step as _step
 from .client import WiggleClient
 from .workflow import Activity, Predicate, SideEffect
 
@@ -420,6 +421,12 @@ class Worker:
             return
 
         stop_heartbeat = self._start_heartbeat(task)
+        scope = None
+        if task.HasField("base_context"):
+            # A forEach item step: the handler's parameter is the ITEM's value (scalars included);
+            # the frozen base and the element's index/source key ride on wiggle.step.
+            scope = _step._begin(from_value(task.base_context), task.item_index,
+                                 task.item_map_key or None)
         try:
             result = handler(from_value(task.context))
             if task.kind == "PREDICATE":
@@ -432,6 +439,8 @@ class Worker:
             log.debug("step %s of %s failed: %s", task.step_name, task.instance_id, e)
             self._client.fail(task.task_id, task.lease_owner, f"{type(e).__name__}: {e}", retryable=True)
         finally:
+            if scope is not None:
+                _step._end(scope)
             stop_heartbeat.set()
 
     def _start_heartbeat(self, task) -> threading.Event:

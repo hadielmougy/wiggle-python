@@ -72,7 +72,7 @@ register. Handlers are **not** part of the topology — a worker binds them sepa
 | `Effect(name, queue=None, retry=None)` | a side-effect step (`handle_effect`); context unchanged |
 | `Gate(name, queue=None, retry=None)` | a predicate (`handle_gate`); false ends the instance as `gated:<name>` |
 | `Fork([Branch(name, steps), …], combine=…)` | run branches **in parallel** on isolated context copies, then rejoin at the **mandatory** `combine` step (`handle_combine`) — no implicit fold; needs ≥ 2 |
-| `ForEach(name, over, as_, body, combine=…)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `over` (bound to `as_`); the **mandatory** `combine` handler receives every item's final context collected under `name` and returns the complete post-join context |
+| `ForEach(name, over, body, combine=…)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `over`. **The element IS the item's context** — body handlers receive the item's value (scalars included), their return replaces it, and the frozen base rides on `wiggle.step.base()`. The **mandatory** `combine` handler receives every item's final value collected under `name` and returns the complete post-join context |
 | `Choose([Case(when, then), …, Case(then)])` | exclusive choice: the first `Case` whose `when` guard holds runs; a `Case` with no `when` is the otherwise (last) |
 | `DoWhile(while_, body)` | run `body`, then repeat while the `while_` predicate holds (body runs at least once) |
 | `SubWorkflow(name, workflow)` | run another workflow (a `Blueprint`, `Graph`, or name) as a child; its result merges back |
@@ -115,27 +115,34 @@ wf = Graph("order", [
 Branches touching different fields merge cleanly; if two write the same key, the later write wins.
 A `Gate` inside a branch short-circuits to that fork's join (not the whole instance).
 
-Runtime fan-out spawns one ISOLATED branch per element (list or map), each seeing its element:
+Runtime fan-out spawns one ISOLATED branch per element (list or map). The element IS each item's
+context — the handler receives the value itself, and its return replaces it:
 
 ```python
+from wiggle import step
+
 wf = Graph("charge", [
-    ForEach("charge-items", over="items", as_="item", body=[
-        Step("price"),   # a handler sees o["item"] (and o["itemIndex"]); item writes stay isolated
+    ForEach("charge-items", over="items", body=[
+        Step("price"),
     ], combine="collect"),
     Step("summarise"),
 ]).compile()
-# start(wf, {"items": [1, 2, 3]}) -> one branch per item; empty/missing skips the body AND the combine
+# start(wf, {"items": [1, 2, 3], "rate": 2}) -> one branch per item;
+# empty/missing skips the body AND the combine
+
+def price(item):                              # the parameter IS the element (scalars included)
+    return item * step.base()["rate"]         # frozen pre-forEach context via wiggle.step (read-only)
 
 def collect(ctx):
-    items = ctx.pop("charge-items")          # every item's final context, collected by the engine:
-    ctx["prices"] = [i["price"] for i in items]  # a list for a list input, a map for a map input
+    prices = ctx.pop("charge-items")          # every item's FINAL VALUE, collected by the engine:
+    ctx["prices"] = prices                    # a list for a list input, a map for a map input
     return ctx                                # the COMPLETE post-join context — it replaces
 
+worker.handle("charge", "price", price)
 worker.handle_combine("charge", "collect", collect)
 ```
 
-Item writes never touch the shared context — no index-namespacing needed; the combine assembles
-the final shape explicitly.
+Items can never touch the shared context; the combine assembles the final shape explicitly.
 
 Per-step `queue` defaults to `default_queue` (a `Graph` field), else the workflow name. Retry policies:
 `Retry.exponential(attempts, initial_s)`, `Retry.fixed(attempts, backoff_s)`, `Retry.none()`,
