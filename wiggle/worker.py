@@ -78,6 +78,24 @@ class _Candidate:
     return_annotation: Any    # inspect return annotation (drives the kind)
 
 
+
+def _with_combine_base(wrapper, items_key_json):
+    """Wraps a combine handler so wiggle.step.base() works inside it: the base is the staged
+    context minus the scratch key(s) (a forEach's collected-results key, or a fork's arm names)."""
+    import json as _json
+    parsed = _json.loads(items_key_json)
+    scratch_keys = [parsed] if isinstance(parsed, str) else list(parsed)
+
+    def wrapped(ctx):
+        base = {k: v for k, v in ctx.items() if k not in scratch_keys} if isinstance(ctx, dict) else ctx
+        token = _step._begin(base, 0, None, item=False)
+        try:
+            return wrapper(ctx)
+        finally:
+            _step._end(token)
+    return wrapped
+
+
 def _collect_handler_methods(handlers: object) -> dict[str, _Candidate]:
     """Introspect ``handlers`` for its step methods, keyed by canonical name. Raises if two public
     methods fold to the same canonical name (ambiguous across case styles), or if a public method does
@@ -276,7 +294,10 @@ class Worker:
                 if kind == "COMBINE" and not is_combine:
                     raise ValueError(f"activity '{activity}' is not a fork combine; bind it with handle()")
                 elif kind == "COMBINE":
-                    pass   # a combine claim on a combine node
+                    # Expose the frozen base ambiently inside the combine: wiggle.step.base() and
+                    # popping the scratch key from the raw dict are both valid access styles.
+                    self._handlers[activity] = _with_combine_base(
+                        self._handlers[activity], node["itemsKey"])
                 elif is_combine:
                     raise ValueError(f"activity '{activity}' is a fork combine; bind it with "
                                      f"handle_combine() -- its return is the complete post-join "
@@ -343,7 +364,7 @@ class Worker:
                                  f"must return the complete post-join context (a dict), not {ret!r}")
             def combine_wrapper(ctx):
                 return method(ctx)
-            return combine_wrapper
+            return _with_combine_base(combine_wrapper, node["itemsKey"])
         # TASK node: task unless the method is a declared side effect (-> None), a bool is a mistake here
         if ret is bool:
             raise ValueError(f"activity '{activity}' is a TASK but handler '{cand.name}' is annotated "

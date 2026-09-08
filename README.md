@@ -134,6 +134,7 @@ def price(item):                              # the parameter IS the element (sc
     return item * step.base()["rate"]         # frozen pre-forEach context via wiggle.step (read-only)
 
 def collect(ctx):
+    # base is also available as step.base() here (the staged results excluded) — your choice
     prices = ctx.pop("charge-items")          # every item's FINAL VALUE, collected by the engine:
     ctx["prices"] = prices                    # a list for a list input, a map for a map input
     return ctx                                # the COMPLETE post-join context — it replaces

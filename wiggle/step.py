@@ -21,8 +21,14 @@ _SCOPE: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar("wiggle
 
 
 def base() -> dict:
-    """The frozen pre-forEach context, as a dict (read-only by contract)."""
-    return _require()[0]
+    """The frozen base context, as a dict (read-only by contract): inside a forEach item step the
+    pre-forEach context; inside a fork/forEach combine the pre-fork context (staged results
+    excluded). Available ambiently so a combine can also read it without popping scratch keys."""
+    scope = _SCOPE.get()
+    if scope is None:
+        raise RuntimeError("wiggle.step.base() is only available inside a forEach item step or a "
+                           "fork/forEach combine")
+    return scope[0]
 
 
 def item_index() -> int:
@@ -37,14 +43,14 @@ def item_map_key() -> Optional[str]:
 
 def _require() -> tuple:
     scope = _SCOPE.get()
-    if scope is None:
-        raise RuntimeError("wiggle.step.base()/item_index()/item_map_key() are only available "
-                           "inside a forEach item step (elsewhere the context IS the handler's parameter)")
+    if scope is None or not scope[3]:
+        raise RuntimeError("wiggle.step.item_index()/item_map_key() are only available inside a "
+                           "forEach item step")
     return scope
 
 
-def _begin(base_ctx: Any, index: int, map_key: Optional[str]) -> contextvars.Token:
-    return _SCOPE.set((base_ctx, index, map_key))
+def _begin(base_ctx: Any, index: int, map_key: Optional[str], item: bool = True) -> contextvars.Token:
+    return _SCOPE.set((base_ctx, index, map_key, item))
 
 
 def _end(token: contextvars.Token) -> None:
