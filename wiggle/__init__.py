@@ -9,6 +9,7 @@ same gRPC control plane as the Java and Go clients, so their workers interoperat
 from .client import InstanceView, ScheduleView, WiggleClient
 from .resolver import CellResolver, Placement, is_legacy_id, parse_id
 from .worker import Handlers, PermanentError, Worker
+from . import step  # noqa: F401  (wiggle.step.base() et al.)
 from .workflow import (
     AwaitSignal,
     Blueprint,
@@ -18,7 +19,7 @@ from .workflow import (
     DoWhile,
     Effect,
     Fork,
-    ForkEach,
+    ForEach,
     Gate,
     Graph,
     Node,
@@ -39,7 +40,7 @@ __all__ = [
     "SubWorkflow",
     "Fork",
     "Branch",
-    "ForkEach",
+    "ForEach",
     "Choose",
     "Case",
     "DoWhile",

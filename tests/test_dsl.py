@@ -13,7 +13,7 @@ from wiggle import (
     DoWhile,
     Effect,
     Fork,
-    ForkEach,
+    ForEach,
     Gate,
     Graph,
     Retry,
@@ -21,7 +21,7 @@ from wiggle import (
     Step,
     SubWorkflow,
 )
-from wiggle._convert import from_value, shallow_diff, to_value
+from wiggle._convert import from_value, to_value
 
 
 def _by_id(bp):
@@ -83,7 +83,7 @@ def test_version_is_structural_independent_of_node_ids():
     from wiggle.workflow import _content_version
     bp = Graph("wf", [
         Step("a"),
-        Fork([Branch("l", [Step("l1")]), Branch("r", [Step("r1")])]),
+        Fork([Branch("l", [Step("l1")]), Branch("r", [Step("r1")])], combine="merge"),
         Step("z"),
     ]).compile()
     # relabel every node id to a totally different scheme, rewriting all edge references too
@@ -175,12 +175,12 @@ def test_await_signal_empty_escalation_rejected():
 
 # ---------------------------------------------------------------- fork / join
 
-def test_fork_creates_fork_and_join_with_expected():
+def test_fork_creates_fork_join_and_mandatory_combine():
     bp = Graph("wf", [
         Fork([
             Branch("l", [Step("l1")]),
             Branch("r", [Step("r1"), Step("r2")]),
-        ]),
+        ], combine="merge"),
         Step("after"),
     ]).compile()
     fork = _kind(bp, "FORK")[0]
@@ -190,28 +190,50 @@ def test_fork_creates_fork_and_join_with_expected():
     assert join["expected"] == 2
     for start in fork["branches"]:
         assert start in byid                      # branch starts exist
-    # both branch tails lead to the join, and the join continues to "after"
+    # the join flows into the mandatory combine (a TASK carrying the arm names on itemsKey),
+    # and only then into "after" -- there is no implicit fold
+    combine = next(n for n in byid.values() if n.get("name") == "merge")
+    assert combine["kind"] == "TASK"
+    assert combine["itemsKey"] == '["l","r"]'
+    assert join["next"] == combine["id"]
     after = next(n for n in byid.values() if n.get("name") == "after")
-    assert join["next"] == after["id"]
+    assert combine["next"] == after["id"]
 
 
 def test_fork_requires_two_branches():
     with pytest.raises(ValueError):
-        Graph("wf", [Fork([Branch("only", [Step("x")])])]).compile()
+        Graph("wf", [Fork([Branch("only", [Step("x")])], combine="merge")]).compile()
 
 
-# ---------------------------------------------------------------- forkEach (dynamic)
+def test_fork_requires_a_combine():
+    with pytest.raises(ValueError, match="combine"):
+        Graph("wf", [Fork([Branch("l", [Step("l1")]), Branch("r", [Step("r1")])])]).compile()
 
-def test_fork_each_dynfork_and_dynamic_join():
+
+# ---------------------------------------------------------------- forEach (dynamic)
+
+def test_for_each_dynfork_join_and_mandatory_combine():
     bp = Graph("wf", [
-        ForkEach("each", over="items", as_="item", body=[Step("price")]),
+        ForEach("each", over="items", body=[Step("price")], combine="collect"),
         Step("sum"),
     ]).compile()
     df = _kind(bp, "DYN_FORK")[0]
     join = _kind(bp, "JOIN")[0]
-    assert df["itemsKey"] == "items" and df["itemKey"] == "item"
-    assert df["branches"] and df["next"] == join["id"]      # empty-list skip -> join
+    byid = _by_id(bp)
+    assert df["itemsKey"] == "items"   # the element is the item's context; no itemKey injection
+    assert df["branches"] and df["next"] == join["id"]      # empty-collection skip -> join
     assert "expected" not in join                           # dynamic width, not a fixed count
+    # the join flows into the mandatory combine, whose itemsKey is a JSON STRING (the scratch key
+    # the collected item results stage under), and only then into "sum"
+    combine = next(n for n in byid.values() if n.get("name") == "collect")
+    assert combine["kind"] == "TASK" and combine["itemsKey"] == '"each"'
+    assert join["next"] == combine["id"]
+    assert combine["next"] == next(n for n in byid.values() if n.get("name") == "sum")["id"]
+
+
+def test_for_each_requires_a_combine():
+    with pytest.raises(ValueError, match="combine"):
+        Graph("wf", [ForEach("each", over="items", body=[Step("price")])]).compile()
 
 
 # ---------------------------------------------------------------- choose
@@ -291,7 +313,13 @@ def test_value_round_trip_and_int_coercion():
     assert isinstance(back["f"], float)
 
 
-def test_shallow_diff_matches_engine_merge():
-    assert shallow_diff({"a": 1, "b": 2}, {"a": 1, "b": 3, "c": 4}) == {"b": 3, "c": 4}
-    assert shallow_diff({"a": 1, "b": 2}, {"a": 1}) == {"b": None}   # dropped key -> null
-    assert shallow_diff({}, {"a": 1}) == {"a": 1}
+def test_task_return_is_sent_whole():
+    # The return REPLACES the context server-side, so the handler's whole return goes on the wire.
+    from wiggle.worker import Worker
+    w = Worker.__new__(Worker)
+    w._handlers = {}
+    w._claims = []
+    w.handle("wf", "s", lambda ctx: {"a": 1})
+    assert w._handlers["wf#s"]({"a": 1, "b": 2}) == {"a": 1}
+    w.handle("wf", "t", lambda ctx: None)
+    assert w._handlers["wf#t"]({"a": 1}) is None   # None = context untouched
