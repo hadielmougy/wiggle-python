@@ -3,20 +3,19 @@ the result. Workers hold no durable state -- a crash loses at most the in-flight
 server re-leases and re-runs."""
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
 import grpc
 
 from ._convert import from_value
 from . import step as _step
+from . import _binder
 from .client import WiggleClient
 from .workflow import Activity, Predicate, SideEffect
 
@@ -43,92 +42,7 @@ class Handlers:
     workflow: Optional[str] = None
 
 
-# tokens split on any non-alphanumeric run, and on camelCase / acronym boundaries
-_NON_ALNUM = re.compile(r"[^0-9A-Za-z]+")
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_ACRONYM_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
-
-
-def _canonical(name: str) -> str:
-    """Fold a name to a case/style-independent key: lowercase alphanumeric tokens, concatenated. So
-    ``in-stock``, ``in_stock``, ``inStock``, ``InStock``, and ``instock`` all yield ``instock``."""
-    spaced = _NON_ALNUM.sub(" ", name)
-    spaced = _ACRONYM_BOUNDARY.sub(" ", _CAMEL_BOUNDARY.sub(" ", spaced))
-    return "".join(tok.lower() for tok in spaced.split())
-
-
-def _accepts_single_context(sig: inspect.Signature) -> bool:
-    """True if the (already-bound) method takes exactly one required positional arg (the context) --
-    or none plus ``*args``. Extra keyword/defaulted params are fine."""
-    required = 0
-    has_var_positional = False
-    for p in sig.parameters.values():
-        if p.kind == inspect.Parameter.VAR_POSITIONAL:
-            has_var_positional = True
-        elif p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-            if p.default is inspect.Parameter.empty:
-                required += 1
-    return required == 1 or (required == 0 and has_var_positional)
-
-
-@dataclass
-class _Candidate:
-    name: str                 # the original method name, for error messages
-    method: Callable
-    return_annotation: Any    # inspect return annotation (drives the kind)
-
-
-
-def _with_combine_base(wrapper, items_key_json):
-    """Wraps a combine handler so wiggle.step.base() works inside it: the base is the staged
-    context minus the scratch key(s) (a forEach's collected-results key, or a fork's arm names)."""
-    import json as _json
-    parsed = _json.loads(items_key_json)
-    scratch_keys = [parsed] if isinstance(parsed, str) else list(parsed)
-
-    def wrapped(ctx):
-        base = {k: v for k, v in ctx.items() if k not in scratch_keys} if isinstance(ctx, dict) else ctx
-        token = _step._begin(base, 0, None, item=False)
-        try:
-            return wrapper(ctx)
-        finally:
-            _step._end(token)
-    return wrapped
-
-
-def _collect_handler_methods(handlers: object) -> dict[str, _Candidate]:
-    """Introspect ``handlers`` for its step methods, keyed by canonical name. Raises if two public
-    methods fold to the same canonical name (ambiguous across case styles), or if a public method does
-    not take a single context argument."""
-    found: dict[str, _Candidate] = {}
-    for attr in sorted(dir(handlers)):
-        if attr.startswith("_") or attr == "workflow":
-            continue
-        try:
-            member = getattr(handlers, attr)
-        except Exception:  # noqa: BLE001 - a property that raises is not a handler
-            continue
-        if not callable(member) or inspect.isclass(member):
-            continue
-        try:
-            sig = inspect.signature(member)
-        except (TypeError, ValueError):
-            continue
-        if not _accepts_single_context(sig):
-            raise ValueError(f"handler method '{attr}' must accept a single context argument "
-                             f"(prefix helper methods with '_' to skip them)")
-        canon = _canonical(attr)
-        if not canon:
-            continue
-        if canon in found:
-            raise ValueError(f"handler methods '{found[canon].name}' and '{attr}' both map to the "
-                             f"same step name '{canon}'; names differing only in case/style are "
-                             f"ambiguous -- rename one")
-        found[canon] = _Candidate(attr, member, sig.return_annotation)
-    if not found:
-        raise ValueError("no handler methods found on the object (public methods taking one context "
-                         "argument)")
-    return found
+_canonical = _binder.canonical   # re-exported: step-name folding lives in wiggle._binder
 
 
 class Worker:
@@ -157,7 +71,7 @@ class Worker:
         self._handlers: dict[str, Callable] = {}
         self._queues: set[str] = set()
         self._claims: list[tuple[str, str, str]] = []   # (workflow, step, expected NodeKind)
-        self._handler_sets: list[tuple[str, dict[str, "_Candidate"]]] = []  # (workflow, candidates)
+        self._handler_sets: list[tuple[str, dict[str, "_binder.Candidate"]]] = []  # (workflow, candidates)
         self._executor: Optional[ThreadPoolExecutor] = None
         self._poll_thread: Optional[threading.Thread] = None
         self._running = threading.Event()
@@ -212,7 +126,7 @@ class Worker:
         if not wf:
             raise ValueError("register_handlers needs a workflow name: pass workflow=... or set a "
                              "'workflow' attribute on the handlers object")
-        candidates = _collect_handler_methods(handlers)   # validates case-fold duplicates
+        candidates = _binder.scan(handlers)   # validates case-fold duplicates
         self._handler_sets.append((wf, candidates))
         return self
 
@@ -296,7 +210,7 @@ class Worker:
                 elif kind == "COMBINE":
                     # Expose the frozen base ambiently inside the combine: wiggle.step.base() and
                     # popping the scratch key from the raw dict are both valid access styles.
-                    self._handlers[activity] = _with_combine_base(
+                    self._handlers[activity] = _binder.with_combine_base(
                         self._handlers[activity], node["itemsKey"])
                 elif is_combine:
                     raise ValueError(f"activity '{activity}' is a fork combine; bind it with "
@@ -314,72 +228,18 @@ class Worker:
         for wf, candidates in self._handler_sets:
             self._match_handler_set(wf, candidates)
 
-    def _match_handler_set(self, wf: str, candidates: dict[str, "_Candidate"]) -> None:
-        """Match a :meth:`register_handlers` object's methods to ``wf``'s steps by canonical name, then
-        bind each with a wrapper whose kind follows the graph (gate vs task) and the method's return
-        annotation (task vs effect). A method matching no step, or a kind clash, fails fast."""
+    def _match_handler_set(self, wf: str, candidates: dict[str, "_binder.Candidate"]) -> None:
+        """Match a :meth:`register_handlers` object's methods to ``wf``'s steps (fetched here — the
+        binder itself is pure) and install the resulting bindings. See :mod:`wiggle._binder`."""
         graph = self._fetch_graph(wf)
-        nodes = {n["name"]: n for n in graph.get("nodes", [])
-                 if n.get("kind") in ("TASK", "PREDICATE") and "name" in n}
-        by_canon: dict[str, tuple[str, dict]] = {}
-        for name, node in nodes.items():
-            by_canon.setdefault(_canonical(name), (name, node))   # graph step names are already unique
-        served: set[str] = set()
-        for canon, cand in candidates.items():
-            match = by_canon.get(canon)
-            if match is None:
-                avail = sorted(nodes)
-                raise ValueError(f"handler '{cand.name}' matches no step in workflow '{wf}' "
-                                 f"(available steps: {avail})")
-            step_name, node = match
-            activity = f"{wf}#{step_name}"
-            if activity in self._handlers:
-                raise ValueError(f"duplicate handler for activity '{activity}'")
-            self._handlers[activity] = self._wrapper_for(cand, node, activity)
-            self._queues.add(node.get("queue", wf))
-            served.add(step_name)
-        unclaimed = sorted(set(nodes) - served)
-        if unclaimed:   # info, not an error: a polyglot worker may intentionally serve a subset
-            log.info("workflow '%s' has steps served by no handler on this worker: %s", wf, unclaimed)
-
-    @staticmethod
-    def _wrapper_for(cand: "_Candidate", node: dict, activity: str) -> Callable:
-        """Build the runtime wrapper for a matched method, validating the method's return annotation
-        against the graph node's kind (the graph decides gate vs task; the annotation decides task vs
-        effect)."""
-        kind = node["kind"]
-        ret = cand.return_annotation
-        method = cand.method
-        empty = inspect.Signature.empty
-        if kind == "PREDICATE":
-            if ret is not empty and ret is not bool:
-                raise ValueError(f"activity '{activity}' is a gate (PREDICATE) but handler "
-                                 f"'{cand.name}' is annotated to return {ret!r}; a gate must return bool")
-            return lambda ctx: bool(method(ctx))
-        if node.get("itemsKey"):
-            # A fork combine: the return is the COMPLETE post-join context, sent verbatim (no
-            # diff) -- the engine replaces the context with it; there is no implicit fold.
-            if ret is bool or ret is None:
-                raise ValueError(f"activity '{activity}' is a fork combine; handler '{cand.name}' "
-                                 f"must return the complete post-join context (a dict), not {ret!r}")
-            def combine_wrapper(ctx):
-                return method(ctx)
-            return _with_combine_base(combine_wrapper, node["itemsKey"])
-        # TASK node: task unless the method is a declared side effect (-> None), a bool is a mistake here
-        if ret is bool:
-            raise ValueError(f"activity '{activity}' is a TASK but handler '{cand.name}' is annotated "
-                             f"to return bool; that looks like a gate -- did you mean a PREDICATE step?")
-        if ret is None:   # explicit `-> None`: a side effect, context unchanged
-            def effect_wrapper(ctx):
-                method(ctx)
-                return None
-            return effect_wrapper
-
-        def task_wrapper(ctx):
-            # The return is the step's COMPLETE next context: sent whole, it replaces the
-            # previous value server-side (None leaves it untouched).
-            return method(ctx)
-        return task_wrapper
+        result = _binder.bind(wf, candidates, graph)
+        for b in result.bindings:
+            if b.activity in self._handlers:
+                raise ValueError(f"duplicate handler for activity '{b.activity}'")
+            self._handlers[b.activity] = b.handler
+            self._queues.add(b.queue)
+        if result.unserved:   # info, not an error: a polyglot worker may intentionally serve a subset
+            log.info("workflow '%s' has steps served by no handler on this worker: %s", wf, result.unserved)
 
     def _fetch_graph(self, workflow: str) -> dict:
         """Fetch the registered graph, optionally waiting out a registration race (the authoring
