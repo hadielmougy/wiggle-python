@@ -16,6 +16,7 @@ import grpc
 from ._convert import from_value
 from . import step as _step
 from . import _binder
+from ._binder import Compensation  # noqa: F401  (re-exported: wiggle.Compensation)
 from .client import WiggleClient
 from .workflow import Activity, Predicate, SideEffect
 
@@ -96,6 +97,22 @@ class Worker:
         def wrapper(ctx):
             return fn(ctx)
         return self._bind(workflow, step, "COMBINE", wrapper)
+
+    def handle_compensation(self, workflow: str, step: str, fn: Callable) -> "Worker":
+        """Bind the undo of a compensable step (one declared ``compensate=True`` in the topology).
+        ``fn`` receives a :class:`wiggle.Compensation` (the step's input/result snapshots) and runs
+        in the reverse pass after the instance fails. ``start`` refuses a worker that serves a
+        compensable step's forward handler without also binding its compensator — the undo task is
+        minted on the same queue, and a worker that can do but not undo would strand the reverse
+        pass."""
+        if not workflow or not step:
+            raise ValueError("workflow and step are required")
+        activity = f"{workflow}#{step}#compensate"
+        if activity in self._handlers:
+            raise ValueError(f"duplicate compensator for activity '{activity}'")
+        self._handlers[activity] = _binder._compensation_wrapper(fn)
+        self._claims.append((workflow, step, "COMPENSATE"))
+        return self
 
     def handle_gate(self, workflow: str, step: str, test: Predicate) -> "Worker":
         """Bind a predicate (gate / choose guard / do-while condition) step by name; ``test`` returns
@@ -205,7 +222,12 @@ class Worker:
                     raise ValueError(f"no step '{step}' in registered workflow '{wf}' "
                                      f"(available steps: {avail})")
                 is_combine = node["kind"] == "TASK" and node.get("itemsKey")
-                if kind == "COMBINE" and not is_combine:
+                if kind == "COMPENSATE":
+                    if node["kind"] != "TASK" or is_combine or not node.get("compensable"):
+                        raise ValueError(f"step '{step}' of workflow '{wf}' is not declared "
+                                         f"compensate=True in the topology; handle_compensation "
+                                         f"binds only compensable steps")
+                elif kind == "COMBINE" and not is_combine:
                     raise ValueError(f"activity '{activity}' is not a fork combine; bind it with handle()")
                 elif kind == "COMBINE":
                     # Expose the frozen base ambiently inside the combine: wiggle.step.base() and
@@ -222,6 +244,19 @@ class Worker:
                                      f"bound as {kind}; use {verb}() instead")
                 self._queues.add(node.get("queue", wf))
                 served.add(activity)
+            # Pairing: a forward handler on a compensable step requires its compensator here too —
+            # the undo task lands on the same queue this worker polls, so "can do but not undo"
+            # would strand the reverse pass at claim time.
+            compensated = {step for w, step, kind in self._claims
+                           if w == wf and kind == "COMPENSATE"}
+            for w, step, kind in self._claims:
+                if w != wf or kind != "TASK" or step in compensated:
+                    continue
+                node = nodes.get(f"{w}#{step}")
+                if node is not None and node.get("compensable"):
+                    raise ValueError(f"step '{step}' of workflow '{wf}' is declared "
+                                     f"compensate=True but this worker binds no compensator; add "
+                                     f"handle_compensation('{wf}', '{step}', ...)")
             unclaimed = sorted(a.split("#", 1)[1] for a in set(nodes) - served)
             if unclaimed:   # info, not an error: a polyglot worker may intentionally serve a subset
                 log.info("workflow '%s' has steps served by no handler on this worker: %s", wf, unclaimed)

@@ -16,7 +16,9 @@ from ._proto import wiggle_pb2 as pb
 from ._proto import wiggle_pb2_grpc as rpc
 from .workflow import Blueprint
 
-TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+# COMPENSATING is NOT terminal: the reverse pass is still running its compensators; it settles
+# as COMPENSATED or COMPENSATION_FAILED.
+TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED", "COMPENSATED", "COMPENSATION_FAILED"})
 
 _log = logging.getLogger("wiggle.client")
 

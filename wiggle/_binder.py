@@ -47,6 +47,18 @@ class Candidate:
     return_annotation: Any    # inspect return annotation (drives the kind)
 
 
+@dataclass(frozen=True)
+class Compensation:
+    """Both context snapshots of the step being undone, captured by the engine at the step's
+    completion — NOT read from the instance's latest context, which a later step may have replaced.
+    ``result`` is the primary snapshot for most undos (the step's own products live there);
+    ``input`` serves restore-previous-value undos and undo-only data (an idempotency key derived
+    from the input), so nothing has to be smuggled through the business context to reach the
+    compensator."""
+    input: Any    # the context as the step received it
+    result: Any   # the context as the step left it — the post-step snapshot
+
+
 @dataclass
 class Binding:
     """One resolved binding: the executable wrapper plus where it plugs into the worker."""
@@ -108,9 +120,21 @@ def bind(workflow: str, candidates: dict[str, Candidate], graph: dict) -> Result
     by_canon: dict[str, tuple[str, dict]] = {}
     for name, node in nodes.items():
         by_canon.setdefault(canonical(name), (name, node))   # graph step names are already unique
+    # Partition out compensators first: a method named compensate_<step> (any case style) whose
+    # canonical name matches no step directly is the undo of <step>. A step literally named
+    # "compensate-x" keeps priority — its handler matches by_canon directly and stays a forward
+    # handler.
+    forward: dict[str, Candidate] = {}
+    compensators: dict[str, Candidate] = {}   # canonical TARGET step -> candidate
+    for canon, cand in candidates.items():
+        target = canon[len("compensate"):] if canon.startswith("compensate") else ""
+        if canon not in by_canon and target and target in by_canon:
+            compensators[target] = cand
+        else:
+            forward[canon] = cand
     bindings: list[Binding] = []
     served: set[str] = set()
-    for canon, cand in candidates.items():
+    for canon, cand in forward.items():
         match = by_canon.get(canon)
         if match is None:
             avail = sorted(nodes)
@@ -121,8 +145,37 @@ def bind(workflow: str, candidates: dict[str, Candidate], graph: dict) -> Result
         bindings.append(Binding(activity, step_name, node.get("queue", workflow),
                                 _wrapper_for(cand, node, activity)))
         served.add(step_name)
+    # Compensators bind under "<activity>#compensate"; the pairing is checked BOTH ways — a
+    # compensate_<x> targeting a non-compensable step is a lie, and a compensable step served
+    # forward without its undo would strand the engine's reverse pass.
+    for target, cand in compensators.items():
+        step_name, node = by_canon[target]
+        if node["kind"] != "TASK" or node.get("itemsKey") or not node.get("compensable"):
+            raise ValueError(f"compensator '{cand.name}' targets step '{step_name}' of workflow "
+                             f"'{workflow}', which is not declared compensate=True in the topology")
+        bindings.append(Binding(f"{workflow}#{step_name}#compensate", step_name,
+                                node.get("queue", workflow), _compensation_wrapper(cand.method)))
+    for canon in forward:
+        match = by_canon.get(canon)
+        if match is None:
+            continue
+        step_name, node = match
+        if node["kind"] == "TASK" and node.get("compensable") and canon not in compensators:
+            raise ValueError(f"step '{step_name}' of workflow '{workflow}' is declared "
+                             f"compensate=True but the handlers object has no "
+                             f"'compensate_{canon}' method taking a wiggle.Compensation")
     unserved = sorted(set(nodes) - served)
     return Result(bindings, unserved)
+
+
+def _compensation_wrapper(method: Callable) -> Callable:
+    """Adapt a compensator method to the runtime handler shape: the engine stages the two
+    snapshots as the activation context ``{"input": ..., "result": ...}``; split them out. The
+    return is None — an undo never changes the (already doomed) instance context."""
+    def wrapped(ctx):
+        method(Compensation(input=ctx.get("input"), result=ctx.get("result")))
+        return None
+    return wrapped
 
 
 def with_combine_base(wrapper: Callable, items_key_json: str) -> Callable:

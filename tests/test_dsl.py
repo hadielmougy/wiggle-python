@@ -340,3 +340,19 @@ def test_task_return_is_sent_whole():
     assert w._handlers["wf#s"]({"a": 1, "b": 2}) == {"a": 1}
     w.handle("wf", "t", lambda ctx: None)
     assert w._handlers["wf#t"]({"a": 1}) is None   # None = context untouched
+
+
+# ---------------------------------------------------------------- compensation
+
+def test_compensate_flag_serializes_only_when_set():
+    from wiggle.workflow import Effect
+    d = Graph("saga", [
+        Step("reserve", compensate=True),
+        Effect("audit", compensate=True),
+        Step("plain"),
+    ]).compile().definition
+    by_name = {n["name"]: n for n in d["nodes"] if "name" in n}
+    assert by_name["reserve"]["compensable"] is True
+    assert by_name["audit"]["compensable"] is True
+    # Absent (not False) when unset — the field must not disturb existing content hashes.
+    assert "compensable" not in by_name["plain"]
