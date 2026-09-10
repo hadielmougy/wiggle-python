@@ -278,6 +278,23 @@ def test_do_while_is_a_cycle():
     assert body["next"] == cond["id"]        # body tail feeds the condition
     assert cond["next"] == body["id"]        # true edge loops back to the body
     assert byid[cond["altNext"]]["name"] == "done"   # false edge continues
+    assert cond["loopBudget"] == -1          # unstated budget = engine-default sentinel
+
+
+def test_do_while_explicit_budget():
+    bp = Graph("wf", [
+        DoWhile(while_="again", body=[Step("body")], max_iterations=500),
+    ]).compile()
+    cond = next(n for n in _by_id(bp).values() if n.get("name") == "again")
+    assert cond["loopBudget"] == 500
+
+    # a plain gate carries no budget at all
+    bp2 = Graph("wf", [Gate("g"), Step("a")]).compile()
+    gate = next(n for n in _by_id(bp2).values() if n.get("name") == "g")
+    assert "loopBudget" not in gate
+
+    with pytest.raises(ValueError, match="max_iterations"):
+        Graph("wf", [DoWhile(while_="again", body=[Step("b")], max_iterations=-2)]).compile()
 
 
 # ---------------------------------------------------------------- sub-workflow
