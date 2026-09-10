@@ -68,8 +68,8 @@ register. Handlers are **not** part of the topology — a worker binds them sepa
 
 | Node | Meaning |
 |---|---|
-| `Step(name, queue=None, retry=None)` | a task run on a worker (`handle`); only changed context keys merge back |
-| `Effect(name, queue=None, retry=None)` | a side-effect step (`handle_effect`); context unchanged |
+| `Step(name, queue=None, retry=None, compensate=False)` | a task run on a worker (`handle`); only changed context keys are merged back. `compensate=True` declares an undo run in the reverse pass if the instance later fails |
+| `Effect(name, queue=None, retry=None, compensate=False)` | a side-effect step (`handle_effect`); context unchanged |
 | `Gate(name, queue=None, retry=None)` | a predicate (`handle_gate`); false ends the instance as `gated:<name>` |
 | `Fork([Branch(name, steps), …], combine=…)` | run branches **in parallel** on isolated context copies, then rejoin at the **mandatory** `combine` step (`handle_combine`) — no implicit fold; needs ≥ 2 |
 | `ForEach(name, over, body, combine=…)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `over`. **The element IS the item's context** — body handlers receive the item's value (scalars included), their return replaces it, and the frozen base rides on `wiggle.step.base()`. The **mandatory** `combine` handler receives every item's final value collected under `name` and returns the complete post-join context |
@@ -155,6 +155,25 @@ matches the Java DSL and the Go client's declarative structs. A `SubWorkflow`'s 
 registered separately (`client.register(child)`), and some worker must serve the child's steps too.
 Because dispatch is by activity name (`"<workflow>#<step>"`), Python, Java, and Go workers interoperate:
 any can run another's steps.
+
+## Compensation (sagas)
+
+A step declared `compensate=True` is undone when the instance later fails: the engine runs the
+step's **compensator** in the reverse pass (newest-completed first) as a real durable task, handing
+it a `wiggle.Compensation` with the step's **input/result context snapshots** captured at
+completion — not the instance's latest context, which a later step may have replaced. The instance
+settles `COMPENSATED` (or `COMPENSATION_FAILED` if an undo exhausts its retries).
+
+```python
+w.handle("order", "reserve", reserve)
+w.handle_compensation("order", "reserve",
+                      lambda c: release_reservation(c.result["reservationRef"]))  # idempotent!
+```
+
+On a `register_handlers` object the compensator is a method named `compensate_<step>` taking the
+`Compensation` (`compensate_reserve` undoes `reserve`). The pairing is checked both ways at start:
+a compensable step served without its compensator — or a compensator targeting a non-compensable
+step — refuses to bind. Compensators are at-least-once like every handler; make them idempotent.
 
 ## Binding handlers by name (polyglot)
 

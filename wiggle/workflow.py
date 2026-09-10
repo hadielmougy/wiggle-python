@@ -84,21 +84,30 @@ class Node:
 @dataclass
 class Step(Node):
     """A unit of work run on a worker; its handler returns the new context (only changed keys merge
-    back). Bind it with ``Worker.handle``."""
+    back). Bind it with ``Worker.handle``.
+
+    ``compensate=True`` declares the step compensable: if the instance later fails, the engine
+    runs the step's compensator (bound with ``Worker.handle_compensation`` or a
+    ``compensate_<step>`` method on a handlers object) in the reverse pass, handing it the
+    input/result context snapshots captured at this step's completion."""
 
     name: str
     queue: Optional[str] = None      # None -> the default queue
     retry: Optional[Retry] = None    # None -> default (retry forever)
+    compensate: bool = False         # declare an undo; a compensator MUST be bound for this step
 
 
 @dataclass
 class Effect(Node):
     """A step run for its side effect only; the context is unchanged. Bind it with
-    ``Worker.handle_effect``. (Topologically identical to a :class:`Step`.)"""
+    ``Worker.handle_effect``. (Topologically identical to a :class:`Step`.) ``compensate``
+    declares an undo exactly as on a :class:`Step` (for an effect the two snapshots are the
+    same context)."""
 
     name: str
     queue: Optional[str] = None
     retry: Optional[Retry] = None
+    compensate: bool = False
 
 
 @dataclass
@@ -408,10 +417,11 @@ class _Builder:
             self.append_node(n)
 
     def append_node(self, n: Node) -> None:
-        if isinstance(n, Step):
-            self.chain(self.g.add_worker("TASK", n.name, n.queue, n.retry))
-        elif isinstance(n, Effect):
-            self.chain(self.g.add_worker("TASK", n.name, n.queue, n.retry))
+        if isinstance(n, (Step, Effect)):
+            nid = self.g.add_worker("TASK", n.name, n.queue, n.retry)
+            if n.compensate:
+                self.g.nodes[nid]["compensable"] = True
+            self.chain(nid)
         elif isinstance(n, Gate):
             nid = self.g.add_worker("PREDICATE", n.name, n.queue, n.retry)
             self.attach(nid)

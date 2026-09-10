@@ -139,3 +139,59 @@ def test_for_each_combine_base_excludes_the_scratch_key():
     result = _binder.bind("wf", _binder.scan(H()), graph)
     collect = next(b.handler for b in result.bindings if b.step == "collect")
     assert collect({"items": [1, 2], "per-item": ["a", "b"]}) == {"items": [1, 2], "n": 2}
+
+
+# ---------------------------------------------------------------- compensation pairing
+
+def _saga():
+    return Graph("saga", [Step("reserve", compensate=True), Step("charge", queue="payments")]) \
+        .compile().definition
+
+
+def test_compensator_binds_and_splits_snapshots():
+    seen = {}
+
+    class H:
+        def reserve(self, ctx): return ctx
+        def charge(self, ctx): return ctx
+        def compensate_reserve(self, comp): seen["comp"] = comp
+
+    result = _binder.bind("saga", _binder.scan(H()), _saga())
+    by_activity = {b.activity: b for b in result.bindings}
+    comp = by_activity["saga#reserve#compensate"]
+    assert comp.queue == "saga", "compensator inherits the forward step's queue"
+
+    # The engine stages the two snapshots as {"input":..., "result":...}; the wrapper splits them.
+    out = comp.handler({"input": {"orderId": "o1"},
+                        "result": {"orderId": "o1", "reservationRef": "r-9"}})
+    assert out is None, "an undo never changes the instance context"
+    assert seen["comp"].input == {"orderId": "o1"}
+    assert seen["comp"].result == {"orderId": "o1", "reservationRef": "r-9"}
+
+
+def test_compensable_step_without_compensator_refuses_to_bind():
+    class H:
+        def reserve(self, ctx): return ctx
+        def charge(self, ctx): return ctx
+    with pytest.raises(ValueError, match="compensate_reserve"):
+        _binder.bind("saga", _binder.scan(H()), _saga())
+
+
+def test_compensator_on_non_compensable_step_refuses_to_bind():
+    class H:
+        def reserve(self, ctx): return ctx
+        def charge(self, ctx): return ctx
+        def compensate_reserve(self, comp): pass
+        def compensate_charge(self, comp): pass   # charge is NOT compensable
+    with pytest.raises(ValueError, match="compensate_charge"):
+        _binder.bind("saga", _binder.scan(H()), _saga())
+
+
+def test_step_literally_named_compensate_x_stays_a_forward_handler():
+    graph = Graph("wf", [Step("compensate-order")]).compile().definition
+
+    class H:
+        def compensate_order(self, ctx): return {**ctx, "handled": True}
+
+    result = _binder.bind("wf", _binder.scan(H()), graph)
+    assert [b.activity for b in result.bindings] == ["wf#compensate-order"]

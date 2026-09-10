@@ -276,3 +276,35 @@ def test_register_handlers_and_handle_conflict_is_a_duplicate():
     w.register_handlers(_OrderHandlers())
     with pytest.raises(ValueError, match="duplicate handler for activity 'order-fulfilment#validate'"):
         w._reconcile()
+
+
+# ---------------------------------------------------------------- compensation (explicit surface)
+
+def _saga_graph():
+    return Graph("saga", [Step("reserve", compensate=True), Step("boom")]).compile().definition
+
+
+def test_handle_compensation_registers_and_reconciles():
+    seen = {}
+    w = _worker({"saga": _saga_graph()})
+    w.handle("saga", "reserve", lambda o: o)
+    w.handle("saga", "boom", lambda o: o)
+    w.handle_compensation("saga", "reserve", lambda comp: seen.update(comp=comp))
+    w._reconcile()
+    wrapper = w._handlers["saga#reserve#compensate"]
+    assert wrapper({"input": {"a": 1}, "result": {"b": 2}}) is None
+    assert seen["comp"].input == {"a": 1} and seen["comp"].result == {"b": 2}
+
+
+def test_forward_handler_on_compensable_step_requires_the_compensator():
+    w = _worker({"saga": _saga_graph()})
+    w.handle("saga", "reserve", lambda o: o)
+    with pytest.raises(ValueError, match="handle_compensation"):
+        w._reconcile()
+
+
+def test_handle_compensation_on_non_compensable_step_is_rejected():
+    w = _worker({"saga": _saga_graph()})
+    w.handle_compensation("saga", "boom", lambda comp: None)
+    with pytest.raises(ValueError, match="not declared compensate=True"):
+        w._reconcile()
