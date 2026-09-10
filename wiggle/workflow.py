@@ -202,10 +202,17 @@ class Choose(Node):
 @dataclass
 class DoWhile(Node):
     """A do-while loop: run ``body`` once, then evaluate the ``while_`` predicate on a worker; while it
-    holds, the body runs again (the body always runs at least once)."""
+    holds, the body runs again (the body always runs at least once).
+
+    Every loop is budgeted: the guard may evaluate true at most ``max_iterations`` times, after
+    which the instance FAILS with a clear error -- an unbounded loop with a buggy condition would
+    hot-spin workers and the database. ``0`` means the engine default
+    (``WIGGLE_LOOP_MAX_ITERATIONS``, 10,000); set it explicitly when a loop legitimately needs
+    more."""
 
     while_: str
     body: list["Node"]
+    max_iterations: int = 0
 
 
 @dataclass
@@ -479,7 +486,11 @@ class _Builder:
         sub.append_nodes(n.body)
         if sub.start is None:
             raise ValueError("do_while body defines no steps")
+        if n.max_iterations < 0:
+            raise ValueError(f"do_while '{n.while_}': max_iterations must be positive (0 = engine default)")
         cond_id = self.g.add_worker("PREDICATE", n.while_, None, None)
+        # -1 = the engine-default budget sentinel, mirroring the Java client's two-arg doWhile.
+        self.g.nodes[cond_id]["loopBudget"] = n.max_iterations if n.max_iterations > 0 else -1
         self.attach(sub.start)                                # enter at the body
         sub.wire_open_to(cond_id)                             # body tail -> condition
         self.g.wire(cond_id, "next", sub.start)               # true: loop back to the body
