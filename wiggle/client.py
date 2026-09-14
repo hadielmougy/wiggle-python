@@ -14,7 +14,7 @@ from google.protobuf import json_format, struct_pb2
 from ._convert import from_value, to_value
 from ._proto import wiggle_pb2 as pb
 from ._proto import wiggle_pb2_grpc as rpc
-from .workflow import Blueprint
+from .workflow import FlowSpec
 
 # COMPENSATING is NOT terminal: the reverse pass is still running its compensators; it settles
 # as COMPENSATED or COMPENSATION_FAILED.
@@ -97,9 +97,9 @@ class WiggleClient:
 
     # ---- workflows & instances ----
 
-    def register(self, blueprint: Blueprint) -> int:
+    def register(self, flow_spec: FlowSpec) -> int:
         """Register a workflow definition; returns its version. Idempotent for the same graph."""
-        struct = json_format.ParseDict(blueprint.definition, struct_pb2.Struct())
+        struct = json_format.ParseDict(flow_spec.definition, struct_pb2.Struct())
         result = self._stub.RegisterWorkflow(pb.WorkflowDefinition(definition=struct),
                                              wait_for_ready=self._wfr)
         return int(result.version)
@@ -111,10 +111,10 @@ class WiggleClient:
         resp = self._stub.GetWorkflow(pb.GetWorkflowRequest(name=name), wait_for_ready=self._wfr)
         return json_format.MessageToDict(resp.definition)
 
-    def start(self, workflow: Union[Blueprint, str], context: Any, *,
+    def start(self, workflow: Union[FlowSpec, str], context: Any, *,
               version: Optional[int] = None, correlation_id: Optional[str] = None) -> str:
         """Start an instance; returns its id."""
-        name = workflow.name if isinstance(workflow, Blueprint) else workflow
+        name = workflow.name if isinstance(workflow, FlowSpec) else workflow
         req = pb.StartInstanceRequest(workflow=name, context=to_value(context))
         if version is not None:
             req.version = version

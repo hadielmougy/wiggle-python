@@ -12,7 +12,7 @@ from .worker import Compensation, Handlers, PermanentError, Worker
 from . import step  # noqa: F401  (wiggle.step.base() et al.)
 from .workflow import (
     AwaitSignal,
-    Blueprint,
+    FlowSpec,
     Branch,
     Case,
     Choose,
@@ -45,7 +45,7 @@ __all__ = [
     "Case",
     "DoWhile",
     "Retry",
-    "Blueprint",
+    "FlowSpec",
     "WiggleClient",
     "InstanceView",
     "ScheduleView",

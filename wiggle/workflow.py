@@ -1,6 +1,6 @@
 """The workflow topology as declarative data: describe a graph of steps, gates, timers, signal waits,
 parallel ``Fork`` and exclusive ``Choose`` as a :class:`Graph` of :class:`Node` values that mirror the
-YAML/graph schema, then :meth:`Graph.compile` it into a :class:`Blueprint` you register and start.
+YAML/graph schema, then :meth:`Graph.compile` it into a :class:`FlowSpec` you register and start.
 
 Handlers are **not** part of the topology -- a :class:`~wiggle.worker.Worker` binds them separately, by
 name (``handle`` / ``handle_gate`` / ``handle_effect``). The graph lives on the server; any worker that
@@ -146,10 +146,10 @@ class AwaitSignal(Node):
 class SubWorkflow(Node):
     """Run another registered workflow as a child: it starts with this instance's context, and on
     completion its final context merges back here. The child must be registered separately; ``workflow``
-    is its name (or a :class:`Blueprint` / :class:`Graph` to take the name from)."""
+    is its name (or a :class:`FlowSpec` / :class:`Graph` to take the name from)."""
 
     name: str
-    workflow: "Union[str, Blueprint, Graph]"
+    workflow: "Union[str, FlowSpec, Graph]"
 
 
 @dataclass
@@ -225,7 +225,7 @@ class DoWhile(Node):
 
 
 @dataclass
-class Blueprint:
+class FlowSpec:
     """A compiled workflow: the definition sent to the server (topology only). Handlers are bound
     separately on a worker, by name."""
 
@@ -238,7 +238,7 @@ class Blueprint:
 @dataclass
 class Graph:
     """A workflow's topology as declarative data. ``compile()`` validates the shape and turns it into a
-    :class:`Blueprint` you register and start.
+    :class:`FlowSpec` you register and start.
 
     ``version`` pins an explicit version instead of the auto content hash. Use it to choose a stable,
     human-meaningful number (or to match another client) -- but then **you** own bumping it when the
@@ -251,7 +251,7 @@ class Graph:
     version: Optional[int] = None
     default_queue: Optional[str] = None
 
-    def compile(self) -> Blueprint:
+    def compile(self) -> FlowSpec:
         if not self.name or not self.name.strip():
             raise ValueError("workflow name is required")
         if not self.steps:
@@ -275,7 +275,7 @@ class Graph:
         }
         version = _check_version(self.version) if self.version is not None else _content_version(definition)
         definition = {"version": version, **definition}
-        return Blueprint(self.name, version, definition, queues)
+        return FlowSpec(self.name, version, definition, queues)
 
 
 class _Graph:
@@ -554,13 +554,13 @@ def _validate_choose(cases: list[Case]) -> bool:
     return has_default
 
 
-def _child_name(workflow: "Union[str, Blueprint, Graph]") -> str:
+def _child_name(workflow: "Union[str, FlowSpec, Graph]") -> str:
     if isinstance(workflow, str):
         child = workflow
-    elif isinstance(workflow, (Blueprint, Graph)):
+    elif isinstance(workflow, (FlowSpec, Graph)):
         child = workflow.name
     else:
-        raise TypeError("workflow must be a Graph, Blueprint, or workflow name")
+        raise TypeError("workflow must be a Graph, FlowSpec, or workflow name")
     if not child:
         raise ValueError("child workflow name is required")
     return child

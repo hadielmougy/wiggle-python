@@ -24,7 +24,7 @@ def charge(ctx: dict) -> dict:
 def main() -> None:
     url = os.environ.get("WIGGLE_URL", "localhost:8080")
     with WiggleClient(url) as client:
-        # No blueprint, no topology -- just implement `charge` by (workflow, step) name.
+        # No flow_spec, no topology -- just implement `charge` by (workflow, step) name.
         # await_registration_s rides out the race if this starts before the Java author registers.
         worker = Worker(client, "py-payments", await_registration_s=30).handle(
             "polyglot-order", "charge", charge)

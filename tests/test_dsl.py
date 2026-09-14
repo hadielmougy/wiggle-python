@@ -303,7 +303,7 @@ def test_sub_workflow_carries_child_name():
     child = Graph("child", [Step("x")]).compile()
     bp = Graph("parent", [
         Step("prep"),
-        SubWorkflow("call", child),          # accepts a Blueprint
+        SubWorkflow("call", child),          # accepts a FlowSpec
     ]).compile()
     sub = _kind(bp, "SUB_WORKFLOW")[0]
     assert sub["activity"] == "child" and sub["name"] == "call"
