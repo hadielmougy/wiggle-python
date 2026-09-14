@@ -59,7 +59,7 @@ def test_reconcile_discovers_the_steps_queue():
     w = _worker({"order-fulfilment": _graph(authorise_queue="payments")})
     w.handle("order-fulfilment", "authorise", lambda o: o)
     w._reconcile()
-    # the worker had no blueprint, so the only queue it now polls is the one learned from the graph
+    # the worker had no flow_spec, so the only queue it now polls is the one learned from the graph
     assert w._served_queues == {"payments"}
 
 

@@ -63,7 +63,7 @@ python examples/order.py               # after `pip install -e .` (or: PYTHONPAT
 ## Topology
 
 A workflow's shape is declarative data — a `Graph(name, steps)` whose `steps` is a list of `Node`
-values that mirror the graph schema. `compile()` validates the shape and returns a `Blueprint` you
+values that mirror the graph schema. `compile()` validates the shape and returns a `FlowSpec` you
 register. Handlers are **not** part of the topology — a worker binds them separately, by name (below).
 
 | Node | Meaning |
@@ -75,7 +75,7 @@ register. Handlers are **not** part of the topology — a worker binds them sepa
 | `ForEach(name, over, body, combine=…)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `over`. **The element IS the item's context** — body handlers receive the item's value (scalars included), their return replaces it, and the frozen base rides on `wiggle.step.base()`. The **mandatory** `combine` handler receives every item's final value collected under `name` and returns the complete post-join context |
 | `Choose([Case(when, then), …, Case(then)])` | exclusive choice: the first `Case` whose `when` guard holds runs; a `Case` with no `when` is the otherwise (last) |
 | `DoWhile(while_, body)` | run `body`, then repeat while the `while_` predicate holds (body runs at least once) |
-| `SubWorkflow(name, workflow)` | run another workflow (a `Blueprint`, `Graph`, or name) as a child; its result merges back |
+| `SubWorkflow(name, workflow)` | run another workflow (a `FlowSpec`, `Graph`, or name) as a child; its result merges back |
 | `Sleep(name, seconds=, millis=)` | server-side timer; no worker is held |
 | `AwaitSignal(name, timeout_s=0, escalation=None)` | wait for a signal via `client.signal(...)`; on timeout, fail — or run the `escalation` nodes and rejoin |
 
@@ -240,9 +240,9 @@ Prefix helpers with `_` to skip them.
 ## Client API
 
 ```python
-client.register(blueprint) -> int                     # version
+client.register(flow_spec) -> int                     # version
 client.get_workflow(name) -> dict                     # the registered graph (steps, kinds, queues)
-client.start(blueprint_or_name, context, *, version=None, correlation_id=None) -> instance_id
+client.start(flow_spec_or_name, context, *, version=None, correlation_id=None) -> instance_id
 client.instance(id) -> InstanceView                   # .status .context .termination_reason .error
 client.await_completion(id, timeout_s=30) -> InstanceView
 client.list_instances(workflow=None, status=None, limit=100)
