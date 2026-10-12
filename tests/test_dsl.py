@@ -16,7 +16,7 @@ from wiggle import (
     ForEach,
     Gate,
     Graph,
-    Retry,
+    RetryPolicy,
     Sleep,
     Step,
     SubWorkflow,
@@ -65,7 +65,7 @@ def test_default_queue_is_workflow_name_and_per_step_override():
 
 
 def test_retry_json_shape():
-    bp = Graph("wf", [Step("a", retry=Retry.exponential(5, 0.1))]).compile()
+    bp = Graph("wf", [Step("a", retry=RetryPolicy.exponential(5, 0.1))]).compile()
     retry = next(n for n in bp.definition["nodes"] if n.get("name") == "a")["retry"]
     assert retry == {"maxAttempts": 5, "initialBackoffMillis": 100, "multiplier": 2.0,
                      "maxBackoffMillis": 300000, "jitter": 0.2}
@@ -190,11 +190,11 @@ def test_fork_creates_fork_join_and_mandatory_combine():
     assert join["expected"] == 2
     for start in fork["branches"]:
         assert start in byid                      # branch starts exist
-    # the join flows into the mandatory combine (a TASK carrying the arm names on itemsKey),
+    # the join flows into the mandatory combine (a TASK carrying the arm names),
     # and only then into "after" -- there is no implicit fold
     combine = next(n for n in byid.values() if n.get("name") == "merge")
     assert combine["kind"] == "TASK"
-    assert combine["itemsKey"] == '["l","r"]'
+    assert combine["armNames"] == ["l", "r"]
     assert join["next"] == combine["id"]
     after = next(n for n in byid.values() if n.get("name") == "after")
     assert combine["next"] == after["id"]
@@ -214,7 +214,7 @@ def test_fork_requires_a_combine():
 
 def test_for_each_dynfork_join_and_mandatory_combine():
     bp = Graph("wf", [
-        ForEach("each", over="items", body=[Step("price")], combine="collect"),
+        ForEach("each", items_key="items", body=[Step("price")], combine="collect"),
         Step("sum"),
     ]).compile()
     df = _kind(bp, "DYN_FORK")[0]
@@ -223,17 +223,17 @@ def test_for_each_dynfork_join_and_mandatory_combine():
     assert df["itemsKey"] == "items"   # the element is the item's context; no itemKey injection
     assert df["branches"] and df["next"] == join["id"]      # empty-collection skip -> join
     assert "expected" not in join                           # dynamic width, not a fixed count
-    # the join flows into the mandatory combine, whose itemsKey is a JSON STRING (the scratch key
-    # the collected item results stage under), and only then into "sum"
+    # the join flows into the mandatory combine, whose collectKey is the scratch key the collected
+    # item results stage under, and only then into "sum"
     combine = next(n for n in byid.values() if n.get("name") == "collect")
-    assert combine["kind"] == "TASK" and combine["itemsKey"] == '"each"'
+    assert combine["kind"] == "TASK" and combine["collectKey"] == "__forEach__each"
     assert join["next"] == combine["id"]
     assert combine["next"] == next(n for n in byid.values() if n.get("name") == "sum")["id"]
 
 
 def test_for_each_requires_a_combine():
     with pytest.raises(ValueError, match="combine"):
-        Graph("wf", [ForEach("each", over="items", body=[Step("price")])]).compile()
+        Graph("wf", [ForEach("each", items_key="items", body=[Step("price")])]).compile()
 
 
 # ---------------------------------------------------------------- choose
@@ -269,7 +269,7 @@ def test_choose_rejects_otherwise_not_last():
 
 def test_do_while_is_a_cycle():
     bp = Graph("wf", [
-        DoWhile(while_="again", body=[Step("body")]),
+        DoWhile(condition="again", body=[Step("body")]),
         Step("done"),
     ]).compile()
     byid = _by_id(bp)
@@ -283,7 +283,7 @@ def test_do_while_is_a_cycle():
 
 def test_do_while_explicit_budget():
     bp = Graph("wf", [
-        DoWhile(while_="again", body=[Step("body")], max_iterations=500),
+        DoWhile(condition="again", body=[Step("body")], max_iterations=500),
     ]).compile()
     cond = next(n for n in _by_id(bp).values() if n.get("name") == "again")
     assert cond["loopBudget"] == 500
@@ -294,7 +294,7 @@ def test_do_while_explicit_budget():
     assert "loopBudget" not in gate
 
     with pytest.raises(ValueError, match="max_iterations"):
-        Graph("wf", [DoWhile(while_="again", body=[Step("b")], max_iterations=-2)]).compile()
+        Graph("wf", [DoWhile(condition="again", body=[Step("b")], max_iterations=-2)]).compile()
 
 
 # ---------------------------------------------------------------- sub-workflow
@@ -303,7 +303,7 @@ def test_sub_workflow_carries_child_name():
     child = Graph("child", [Step("x")]).compile()
     bp = Graph("parent", [
         Step("prep"),
-        SubWorkflow("call", child),          # accepts a Blueprint
+        SubWorkflow("call", child),          # accepts a FlowSpec
     ]).compile()
     sub = _kind(bp, "SUB_WORKFLOW")[0]
     assert sub["activity"] == "child" and sub["name"] == "call"

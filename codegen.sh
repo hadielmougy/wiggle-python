@@ -16,10 +16,10 @@ python3 -m grpc_tools.protoc \
     -I "$PROTO_DIR" \
     --python_out="$OUT" \
     --grpc_python_out="$OUT" \
-    "$PROTO_DIR/wiggle.proto" "$PROTO_DIR/coordinator.proto"
+    "$PROTO_DIR/wiggle.proto"
 
 # generated stubs import sibling '*_pb2' modules absolutely; make them relative so they work as a
-# package (covers wiggle_pb2, coordinator_pb2, and the grpc modules importing each other).
+# package (covers wiggle_pb2 and the grpc module importing it).
 perl -pi -e 's/^import (\w+_pb2)( as|\b)/from . import $1$2/' "$OUT"/*_pb2.py "$OUT"/*_pb2_grpc.py
 : > "$OUT/__init__.py"
 echo "regenerated stubs in $OUT"

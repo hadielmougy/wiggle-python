@@ -5,7 +5,7 @@
 """
 import os
 
-from wiggle import Effect, Gate, Graph, Retry, Step, WiggleClient, Worker
+from wiggle import Effect, Gate, Graph, RetryPolicy, Step, WiggleClient, Worker
 
 
 def topology() -> "Graph":
@@ -13,7 +13,7 @@ def topology() -> "Graph":
     return Graph("py-order", [
         Step("validate"),
         Gate("in-stock"),
-        Step("charge", queue="payments", retry=Retry.exponential(5, 0.1)),
+        Step("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1)),
         Step("ship"),
         Effect("notify"),
     ])
@@ -48,7 +48,7 @@ def main() -> None:
                       + (f"  ({view.termination_reason})" if view.termination_reason else "")
                       + (f"  ERROR: {view.error}" if view.error else ""))
         finally:
-            worker.stop()
+            worker.close()
 
 
 if __name__ == "__main__":

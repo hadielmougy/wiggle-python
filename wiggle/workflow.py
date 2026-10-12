@@ -1,6 +1,6 @@
 """The workflow topology as declarative data: describe a graph of steps, gates, timers, signal waits,
 parallel ``Fork`` and exclusive ``Choose`` as a :class:`Graph` of :class:`Node` values that mirror the
-YAML/graph schema, then :meth:`Graph.compile` it into a :class:`Blueprint` you register and start.
+YAML/graph schema, then :meth:`Graph.compile` it into a :class:`FlowSpec` you register and start.
 
 Handlers are **not** part of the topology -- a :class:`~wiggle.worker.Worker` binds them separately, by
 name (``handle`` / ``handle_gate`` / ``handle_effect``). The graph lives on the server; any worker that
@@ -10,13 +10,13 @@ The context is a plain ``dict`` that flows through the steps. A handler returns 
 (usually ``{**ctx, ...}``); the engine merges only what changed, so parallel branches that touch
 different fields merge cleanly.
 
-    from wiggle import Graph, Step, Gate, Effect, Fork, Branch, Retry
+    from wiggle import Graph, Step, Gate, Effect, Fork, Branch, RetryPolicy
 
     wf = Graph("order", [
         Step("validate"),
         Gate("in-stock"),
         Fork([
-            Branch("payment",  [Step("charge", queue="payments", retry=Retry.exponential(5, 0.1))]),
+            Branch("payment",  [Step("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1))]),
             Branch("shipping", [Step("reserve"), Step("label")]),
         ]),
         Effect("notify"),
@@ -26,9 +26,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
+
+# The engine stages a join's results under reserved keys so they cannot collide with the workflow's
+# own data: a fork arm under ARM_SCRATCH_PREFIX + arm, a forEach's collected results under the
+# combine's collectKey -- FOR_EACH_SCRATCH_PREFIX + name for a forEach, SPAWN_SCRATCH_PREFIX + step for
+# branches a step created -- and the step that produced each result under STEPS_SCRATCH_PREFIX + collectKey.
+ARM_SCRATCH_PREFIX = "__arm__"
+FOR_EACH_SCRATCH_PREFIX = "__forEach__"
+SPAWN_SCRATCH_PREFIX = "__spawn__"
+STEPS_SCRATCH_PREFIX = "__steps__"
 
 _MAX_INT = 2_147_483_647
 
@@ -39,7 +49,7 @@ Predicate = Callable[[Context], bool]        # gate / choose guard / do-while co
 
 
 @dataclass(frozen=True)
-class Retry:
+class RetryPolicy:
     """A per-step retry policy. Backoffs are given in seconds."""
 
     max_attempts: int = _MAX_INT
@@ -58,20 +68,20 @@ class Retry:
         }
 
     @staticmethod
-    def forever() -> "Retry":
-        return Retry(_MAX_INT, 1.0, 1.0, 60.0, 0.0)
+    def forever() -> "RetryPolicy":
+        return RetryPolicy(_MAX_INT, 1.0, 1.0, 60.0, 0.0)
 
     @staticmethod
-    def none() -> "Retry":
-        return Retry(1, 0.0, 1.0, 0.0, 0.0)
+    def none() -> "RetryPolicy":
+        return RetryPolicy(1, 0.0, 1.0, 0.0, 0.0)
 
     @staticmethod
-    def exponential(max_attempts: int, initial_backoff_s: float) -> "Retry":
-        return Retry(max_attempts, initial_backoff_s, 2.0, 300.0, 0.2)
+    def exponential(max_attempts: int, initial_backoff_s: float) -> "RetryPolicy":
+        return RetryPolicy(max_attempts, initial_backoff_s, 2.0, 300.0, 0.2)
 
     @staticmethod
-    def fixed(max_attempts: int, backoff_s: float) -> "Retry":
-        return Retry(max_attempts, backoff_s, 1.0, backoff_s, 0.0)
+    def fixed(max_attempts: int, backoff_s: float) -> "RetryPolicy":
+        return RetryPolicy(max_attempts, backoff_s, 1.0, backoff_s, 0.0)
 
 
 # ---- the declarative node types (mirror the graph schema) ----
@@ -89,12 +99,18 @@ class Step(Node):
     ``compensate=True`` declares the step compensable: if the instance later fails, the engine
     runs the step's compensator (bound with ``Worker.handle_compensation`` or a
     ``compensate_<step>`` method on a handlers object) in the reverse pass, handing it the
-    input/result context snapshots captured at this step's completion."""
+    input/result context snapshots captured at this step's completion.
+
+    ``combine`` makes the step a spawning step: its handler may ``wiggle.step.create`` branches,
+    and the combine step ``combine`` (bound with ``Worker.handle_combine``) receives their results
+    under this step's name and returns the post-join context. The combine always runs, with an
+    empty collection when the step created nothing, and may itself create the next round."""
 
     name: str
     queue: Optional[str] = None      # None -> the default queue
-    retry: Optional[Retry] = None    # None -> default (retry forever)
+    retry: Optional[RetryPolicy] = None    # None -> default (retry forever)
     compensate: bool = False         # declare an undo; a compensator MUST be bound for this step
+    combine: str = ""                # a spawning step: the combine its created branches rejoin at
 
 
 @dataclass
@@ -102,12 +118,13 @@ class Effect(Node):
     """A step run for its side effect only; the context is unchanged. Bind it with
     ``Worker.handle_effect``. (Topologically identical to a :class:`Step`.) ``compensate``
     declares an undo exactly as on a :class:`Step` (for an effect the two snapshots are the
-    same context)."""
+    same context). ``combine`` makes it a spawning step, as on a :class:`Step`."""
 
     name: str
     queue: Optional[str] = None
-    retry: Optional[Retry] = None
+    retry: Optional[RetryPolicy] = None
     compensate: bool = False
+    combine: str = ""
 
 
 @dataclass
@@ -118,7 +135,7 @@ class Gate(Node):
 
     name: str
     queue: Optional[str] = None
-    retry: Optional[Retry] = None
+    retry: Optional[RetryPolicy] = None
 
 
 @dataclass
@@ -146,10 +163,10 @@ class AwaitSignal(Node):
 class SubWorkflow(Node):
     """Run another registered workflow as a child: it starts with this instance's context, and on
     completion its final context merges back here. The child must be registered separately; ``workflow``
-    is its name (or a :class:`Blueprint` / :class:`Graph` to take the name from)."""
+    is its name (or a :class:`FlowSpec` / :class:`Graph` to take the name from)."""
 
     name: str
-    workflow: "Union[str, Blueprint, Graph]"
+    workflow: "Union[str, FlowSpec, Graph]"
 
 
 @dataclass
@@ -176,7 +193,7 @@ class Fork(Node):
 
 @dataclass
 class ForEach(Node):
-    """Runtime fan-out: at run time the engine reads the collection in the context at ``over`` (a
+    """Runtime fan-out: at run time the engine reads the collection in the context at ``items_key`` (a
     list or a map) and spawns one parallel branch per element, each on its own ISOLATED copy of the
     context with the element injected under ``as_`` (its index under ``as_ + "Index"`` and, for a
     map, its key under ``as_ + "Key"``). Item writes never touch the shared context. ``combine``
@@ -186,7 +203,7 @@ class ForEach(Node):
     replaces the context with it). An empty collection skips the body and the combine."""
 
     name: str
-    over: str                # itemsKey: the context key holding the collection
+    items_key: str           # the context key holding the collection
     body: list["Node"]
     combine: str = ""
 
@@ -210,7 +227,7 @@ class Choose(Node):
 
 @dataclass
 class DoWhile(Node):
-    """A do-while loop: run ``body`` once, then evaluate the ``while_`` predicate on a worker; while it
+    """A do-while loop: run ``body`` once, then evaluate the ``condition`` predicate on a worker; while it
     holds, the body runs again (the body always runs at least once).
 
     Every loop is budgeted: the guard may evaluate true at most ``max_iterations`` times, after
@@ -219,13 +236,13 @@ class DoWhile(Node):
     (``WIGGLE_LOOP_MAX_ITERATIONS``, 10,000); set it explicitly when a loop legitimately needs
     more."""
 
-    while_: str
+    condition: str
     body: list["Node"]
     max_iterations: int = 0
 
 
 @dataclass
-class Blueprint:
+class FlowSpec:
     """A compiled workflow: the definition sent to the server (topology only). Handlers are bound
     separately on a worker, by name."""
 
@@ -235,10 +252,49 @@ class Blueprint:
     queues: list[str]
 
 
+_ATTRIBUTE_NAME = re.compile(r"[a-z][a-z0-9_]{0,62}")
+MAX_ATTRIBUTES = 16
+
+
+class AttrType:
+    """The type of a declared :class:`Attribute`, and how a context value is read as one."""
+    STRING = "STRING"
+    LONG = "LONG"
+    DECIMAL = "DECIMAL"
+    BOOLEAN = "BOOLEAN"
+
+
+_ATTRIBUTE_TYPES = (AttrType.STRING, AttrType.LONG, AttrType.DECIMAL, AttrType.BOOLEAN)
+
+
+@dataclass(frozen=True)
+class Attribute:
+    """A value the workflow declares for queue criteria to test (``Task_.attr(name)``): ``path`` is
+    a dotted path into the context a step receives, read as ``type`` -- an :class:`AttrType`. The
+    server extracts it each time a step becomes ready; a value that is missing or does not fit the
+    type is absent."""
+
+    name: str
+    type: str
+    path: str
+
+    def __post_init__(self):
+        if not _ATTRIBUTE_NAME.fullmatch(self.name or ""):
+            raise ValueError(f"attribute name '{self.name}' must match {_ATTRIBUTE_NAME.pattern}")
+        if self.type not in _ATTRIBUTE_TYPES:
+            raise ValueError(f"attribute '{self.name}' type must be one of {_ATTRIBUTE_TYPES}, "
+                             f"got {self.type!r}")
+        if not self.path or "" in self.path.split("."):
+            raise ValueError(f"attribute '{self.name}' needs a dotted path, got '{self.path}'")
+
+    def to_json(self) -> dict:
+        return {"name": self.name, "type": self.type, "path": self.path}
+
+
 @dataclass
 class Graph:
     """A workflow's topology as declarative data. ``compile()`` validates the shape and turns it into a
-    :class:`Blueprint` you register and start.
+    :class:`FlowSpec` you register and start.
 
     ``version`` pins an explicit version instead of the auto content hash. Use it to choose a stable,
     human-meaningful number (or to match another client) -- but then **you** own bumping it when the
@@ -250,12 +306,18 @@ class Graph:
     steps: list[Node] = field(default_factory=list)
     version: Optional[int] = None
     default_queue: Optional[str] = None
+    attributes: list[Attribute] = field(default_factory=list)   # values queue criteria can test
 
-    def compile(self) -> Blueprint:
+    def compile(self) -> FlowSpec:
         if not self.name or not self.name.strip():
             raise ValueError("workflow name is required")
         if not self.steps:
             raise ValueError("workflow has no steps")
+        if len(self.attributes) > MAX_ATTRIBUTES:
+            raise ValueError(f"a workflow declares at most {MAX_ATTRIBUTES} attributes, "
+                             f"got {len(self.attributes)}")
+        if len({a.name for a in self.attributes}) != len(self.attributes):
+            raise ValueError("an attribute is declared twice")
 
         graph = _Graph(self.name, self.default_queue or self.name)
         root = _Builder(graph, enclosing_join=None, is_root=True)
@@ -273,9 +335,11 @@ class Graph:
             "queues": queues,
             "executionMode": "SERVER",
         }
+        if self.attributes:
+            definition["attributes"] = [a.to_json() for a in self.attributes]
         version = _check_version(self.version) if self.version is not None else _content_version(definition)
         definition = {"version": version, **definition}
-        return Blueprint(self.name, version, definition, queues)
+        return FlowSpec(self.name, version, definition, queues)
 
 
 class _Graph:
@@ -301,13 +365,13 @@ class _Graph:
             raise ValueError(f"duplicate step name '{name}'")
         self.reserved.add(name)
 
-    def add_worker(self, kind: str, name: str, queue: Optional[str], retry: Optional[Retry]) -> str:
+    def add_worker(self, kind: str, name: str, queue: Optional[str], retry: Optional[RetryPolicy]) -> str:
         self._reserve(name)
         nid = self._nid()
         q = queue or self.default_queue
         self.queues.add(q)
         self.nodes[nid] = {"id": nid, "kind": kind, "name": name, "activity": f"{self.name}#{name}",
-                           "queue": q, "retry": (retry or Retry.forever()).to_json()}
+                           "queue": q, "retry": (retry or RetryPolicy.forever()).to_json()}
         return nid
 
     def add_timer(self, kind: str, name: str, millis: int, reserve: bool) -> str:
@@ -341,18 +405,24 @@ class _Graph:
 
     def add_combine(self, name: str, arms: list[str]) -> str:
         """The mandatory merge node after a fork's join: a TASK bound by name like any step, carrying
-        the fork's arm names (a JSON array) on its ``itemsKey`` so the engine can stage each isolated
-        branch's result under its name for the handler, and strip those keys afterward."""
+        the fork's ``armNames`` so the engine can stage each isolated branch's result for the
+        handler, and strip it afterward."""
         nid = self.add_worker("TASK", name, None, None)
-        self.nodes[nid]["itemsKey"] = json.dumps(arms, separators=(",", ":"))
+        self.nodes[nid]["armNames"] = list(arms)
         return nid
 
-    def add_for_each_combine(self, name: str, scratch_key: str) -> str:
-        """The mandatory merge node after a forEach's join: a TASK bound by name whose ``itemsKey``
-        is a JSON STRING (the scratch key the engine stages the collected item results under) —
-        versus a fork combine's arm-name array."""
+    def add_for_each_combine(self, name: str, for_each_name: str) -> str:
+        """The mandatory merge node after a forEach's join: a TASK bound by name whose ``collectKey``
+        is the scratch key the engine stages the collected item results under."""
         nid = self.add_worker("TASK", name, None, None)
-        self.nodes[nid]["itemsKey"] = json.dumps(scratch_key)
+        self.nodes[nid]["collectKey"] = FOR_EACH_SCRATCH_PREFIX + for_each_name
+        return nid
+
+    def add_spawn_combine(self, name: str, step_name: str) -> str:
+        """The combine after a spawning step: a TASK bound by name whose ``collectKey`` stages the
+        results of the branches ``step_name`` created."""
+        nid = self.add_worker("TASK", name, None, None)
+        self.nodes[nid]["collectKey"] = SPAWN_SCRATCH_PREFIX + step_name
         return nid
 
     def add_join(self, expected: int) -> str:
@@ -422,6 +492,10 @@ class _Builder:
             if n.compensate:
                 self.g.nodes[nid]["compensable"] = True
             self.chain(nid)
+            if n.combine:
+                join_id = self.g.add_join(0)                  # 0 = as many as the step creates
+                self.chain(join_id)
+                self.chain(self.g.add_spawn_combine(n.combine, n.name))
         elif isinstance(n, Gate):
             nid = self.g.add_worker("PREDICATE", n.name, n.queue, n.retry)
             self.attach(nid)
@@ -481,7 +555,7 @@ class _Builder:
         if not n.combine:
             raise ValueError("for_each needs a combine step name (ForEach(..., combine=...)): item "
                              "results rejoin at an explicit merge handler; there is no implicit fold")
-        fork_id = self.g.add_dynfork(n.name, n.over, n.over)
+        fork_id = self.g.add_dynfork(n.name, n.items_key, n.items_key)
         self.attach(fork_id)
         join_id = self.g.add_join(0)                          # 0 = dynamic width
         template_start = self._build_branch(Branch(n.name, n.body), join_id)
@@ -497,8 +571,8 @@ class _Builder:
         if sub.start is None:
             raise ValueError("do_while body defines no steps")
         if n.max_iterations < 0:
-            raise ValueError(f"do_while '{n.while_}': max_iterations must be positive (0 = engine default)")
-        cond_id = self.g.add_worker("PREDICATE", n.while_, None, None)
+            raise ValueError(f"do_while '{n.condition}': max_iterations must be positive (0 = engine default)")
+        cond_id = self.g.add_worker("PREDICATE", n.condition, None, None)
         # -1 = the engine-default budget sentinel, mirroring the Java client's two-arg doWhile.
         self.g.nodes[cond_id]["loopBudget"] = n.max_iterations if n.max_iterations > 0 else -1
         self.attach(sub.start)                                # enter at the body
@@ -554,13 +628,13 @@ def _validate_choose(cases: list[Case]) -> bool:
     return has_default
 
 
-def _child_name(workflow: "Union[str, Blueprint, Graph]") -> str:
+def _child_name(workflow: "Union[str, FlowSpec, Graph]") -> str:
     if isinstance(workflow, str):
         child = workflow
-    elif isinstance(workflow, (Blueprint, Graph)):
+    elif isinstance(workflow, (FlowSpec, Graph)):
         child = workflow.name
     else:
-        raise TypeError("workflow must be a Graph, Blueprint, or workflow name")
+        raise TypeError("workflow must be a Graph, FlowSpec, or workflow name")
     if not child:
         raise ValueError("child workflow name is required")
     return child
@@ -621,6 +695,8 @@ def _content_version(definition: dict) -> int:
         "nodes": canon_nodes,
         "executionMode": definition["executionMode"],
     }
+    if "attributes" in definition:
+        material["attributes"] = definition["attributes"]
     canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).digest()
     v = ((digest[0] & 0x7F) << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]

@@ -3,8 +3,7 @@
 An idiomatic Python client and worker for [Wiggle](../../README.md), the durable state-machine
 platform. It speaks the same gRPC control plane as the Java client, so **Python and Java workers
 interoperate** on the same server: define a flow in either language, and any worker that registers the
-matching handlers can run its steps. In a coordinator-sharded deployment the client resolves the
-owning cell per instance.
+matching handlers can run its steps.
 
 - **Control client** — register workflows, start and track instances, deliver signals, manage schedules.
 - **Worker** — implement steps by name; pull tasks you have capacity for, run handlers, report results; automatic lease heartbeats and retries.
@@ -24,13 +23,13 @@ Requires Python 3.9+ and a running Wiggle server — see the [engine repo](https
 ## Quick start
 
 ```python
-from wiggle import Graph, Step, Gate, Effect, Sleep, Retry, WiggleClient, Worker
+from wiggle import Graph, Step, Gate, Effect, Sleep, RetryPolicy, WiggleClient, Worker
 
 # 1. Describe the topology as declarative data -- a Graph that mirrors the graph schema.
 wf = Graph("order", [
     Step("validate"),
     Gate("in-stock"),                                   # false -> ends as gated:in-stock
-    Step("charge", queue="payments", retry=Retry.exponential(5, 0.1)),
+    Step("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1)),
     Sleep("cool-off", seconds=1),
     Effect("notify"),
 ]).compile()
@@ -51,7 +50,7 @@ with WiggleClient("localhost:8080") as client:
         view = client.await_completion(iid, timeout_s=30)
         print(view.status, view.context)                   # COMPLETED {...}
     finally:
-        worker.stop()
+        worker.close()
 ```
 
 Run the bundled example against a server on `:8080`:
@@ -63,26 +62,28 @@ python examples/order.py               # after `pip install -e .` (or: PYTHONPAT
 ## Topology
 
 A workflow's shape is declarative data — a `Graph(name, steps)` whose `steps` is a list of `Node`
-values that mirror the graph schema. `compile()` validates the shape and returns a `Blueprint` you
+values that mirror the graph schema. `compile()` validates the shape and returns a `FlowSpec` you
 register. Handlers are **not** part of the topology — a worker binds them separately, by name (below).
 
 | Node | Meaning |
 |---|---|
-| `Step(name, queue=None, retry=None, compensate=False)` | a task run on a worker (`handle`); only changed context keys are merged back. `compensate=True` declares an undo run in the reverse pass if the instance later fails |
+| `Step(name, queue=None, retry=None, compensate=False)` | a task run on a worker (`handle`); its return replaces the context. `compensate=True` declares an undo run in the reverse pass if the instance later fails |
 | `Effect(name, queue=None, retry=None, compensate=False)` | a side-effect step (`handle_effect`); context unchanged |
 | `Gate(name, queue=None, retry=None)` | a predicate (`handle_gate`); false ends the instance as `gated:<name>` |
 | `Fork([Branch(name, steps), …], combine=…)` | run branches **in parallel** on isolated context copies, then rejoin at the **mandatory** `combine` step (`handle_combine`) — no implicit fold; needs ≥ 2 |
-| `ForEach(name, over, body, combine=…)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `over`. **The element IS the item's context** — body handlers receive the item's value (scalars included), their return replaces it, and the frozen base rides on `wiggle.step.base()`. The **mandatory** `combine` handler receives every item's final value collected under `name` and returns the complete post-join context |
+| `ForEach(name, items_key, body, combine=…)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `items_key`. **The element IS the item's context** — body handlers receive the item's value (scalars included), their return replaces it, and the frozen base rides on `wiggle.step.base()`. The **mandatory** `combine` handler receives every item's final value collected under `name` and returns the complete post-join context |
 | `Choose([Case(when, then), …, Case(then)])` | exclusive choice: the first `Case` whose `when` guard holds runs; a `Case` with no `when` is the otherwise (last) |
-| `DoWhile(while_, body)` | run `body`, then repeat while the `while_` predicate holds (body runs at least once) |
-| `SubWorkflow(name, workflow)` | run another workflow (a `Blueprint`, `Graph`, or name) as a child; its result merges back |
+| `DoWhile(condition, body)` | run `body`, then repeat while the `condition` predicate holds (body runs at least once) |
+| `SubWorkflow(name, workflow)` | run another workflow (a `FlowSpec`, `Graph`, or name) as a child; its result merges back |
 | `Sleep(name, seconds=, millis=)` | server-side timer; no worker is held |
 | `AwaitSignal(name, timeout_s=0, escalation=None)` | wait for a signal via `client.signal(...)`; on timeout, fail — or run the `escalation` nodes and rejoin |
 
 A fork's combine is bound with `handle_combine(workflow, step, fn)`: `fn` receives the context with
 each branch's result staged under the branch's name, and must return the **complete** post-join
 context — the engine replaces the context with it, so keys the handler omits do not survive the
-join (there is no implicit union of the arms):
+join (there is no implicit union of the arms). The engine stages the arm results under reserved
+keys; the worker hands them to `fn` under the branch names, and fails the step if a branch name is
+also a key of the context itself (rename one of them):
 
 ```python
 def merge(ctx):
@@ -122,7 +123,7 @@ context — the handler receives the value itself, and its return replaces it:
 from wiggle import step
 
 wf = Graph("charge", [
-    ForEach("charge-items", over="items", body=[
+    ForEach("charge-items", items_key="items", body=[
         Step("price"),
     ], combine="collect"),
     Step("summarise"),
@@ -145,9 +146,9 @@ worker.handle_combine("charge", "collect", collect)
 
 Items can never touch the shared context; the combine assembles the final shape explicitly.
 
-Per-step `queue` defaults to `default_queue` (a `Graph` field), else the workflow name. Retry policies:
-`Retry.exponential(attempts, initial_s)`, `Retry.fixed(attempts, backoff_s)`, `Retry.none()`,
-`Retry.forever()`. Raise `wiggle.PermanentError` from a handler to fail a step **without** retrying.
+Per-step `queue` defaults to `default_queue` (a `Graph` field), else the workflow name. RetryPolicy policies:
+`RetryPolicy.exponential(attempts, initial_s)`, `RetryPolicy.fixed(attempts, backoff_s)`, `RetryPolicy.none()`,
+`RetryPolicy.forever()`. Raise `wiggle.PermanentActivityError` from a handler to fail a step **without** retrying.
 
 The node set —
 `Step`/`Gate`/`Effect`/`Fork`/`ForEach`/`Choose`/`DoWhile`/`SubWorkflow`/`Sleep`/`AwaitSignal` —
@@ -170,7 +171,7 @@ w.handle_compensation("order", "reserve",
                       lambda c: release_reservation(c.result["reservationRef"]))  # idempotent!
 ```
 
-On a `register_handlers` object the compensator is a method named `compensate_<step>` taking the
+On a `register_handler` object the compensator is a method named `compensate_<step>` taking the
 `Compensation` (`compensate_reserve` undoes `reserve`). The pairing is checked both ways at start:
 a compensable step served without its compensator — or a compensator targeting a non-compensable
 step — refuses to bind. Compensators are at-least-once like every handler; make them idempotent.
@@ -203,15 +204,15 @@ ride out a startup race instead of failing fast. See
 [`examples/polyglot_worker.py`](examples/polyglot_worker.py) for a Java-authored flow served from
 Python.
 
-### A whole object of handlers: `register_handlers`
+### A whole object of handlers: `register_handler`
 
 Instead of one `handle(...)` call per step, hand the worker an object whose methods *are* the steps:
 
 ```python
-from wiggle import Handlers, Worker
+from wiggle import Worker, for_flow
 
-class OrderHandlers(Handlers):
-    workflow = "order-fulfilment"                 # or pass workflow=... to register_handlers
+@for_flow("order-fulfilment")                     # as Java's @ForFlow; or pass workflow=... to register_handler
+class OrderHandlers:
 
     def validate(self, o) -> dict:                # -> a task (returns the new context)
         return {**o, "status": "VALIDATED"}
@@ -225,7 +226,7 @@ class OrderHandlers(Handlers):
     def _receipt(self, o):                        # underscore -> a helper, not a step handler
         ...
 
-worker = Worker(client, "orders").register_handlers(OrderHandlers())
+worker = Worker(client, "orders").register_handler(OrderHandlers())
 worker.start()
 ```
 
@@ -234,23 +235,49 @@ Each public method is matched to a step **by name, regardless of case style** �
 return annotation**: `-> bool` is a gate, `-> None` a side effect, anything else (or no annotation) a
 task. The graph stays the source of truth for the exact step name and for gate-vs-task, so an
 annotation that contradicts it fails fast. Two methods whose names collide under case-folding are
-rejected at `register_handlers` time (ambiguous); a method matching no step is caught on `start()`.
+rejected at `register_handler` time (ambiguous); a method matching no step is caught on `start()`.
 Prefix helpers with `_` to skip them.
 
 ## Client API
 
 ```python
-client.register(blueprint) -> int                     # version
+client.register(flow_spec) -> int                     # version
 client.get_workflow(name) -> dict                     # the registered graph (steps, kinds, queues)
-client.start(blueprint_or_name, context, *, version=None, correlation_id=None) -> instance_id
+client.start(flow_spec_or_name, context, *, version=None, correlation_id=None) -> instance_id
 client.instance(id) -> InstanceView                   # .status .context .termination_reason .error
 client.await_completion(id, timeout_s=30) -> InstanceView
 client.list_instances(workflow=None, status=None, limit=100)
 client.cancel(id, reason="cancelled")
 client.signal(id, name, payload=None)
-client.create_schedule(workflow, every_s=..|cron=.., context=None) / list_schedules() / delete_schedule(id)
+client.create_schedule(workflow, every_s, context=None) / create_cron_schedule(workflow, cron, context=None)
+client.schedules() / delete_schedule(id)
 client.health() / client.cluster()
+
+client.register(flow_spec, force=True)                # replace a differing graph at the same version (server must allow it)
+client.poll_events(consumer, max_events=100, wait_s=10, start_from=0) -> EventBatch   # the durable event log
+client.ack_events(consumer, cursor=batch.events[-1].cursor)
+client.search(text, workflow=None, status=None, semantic=False, ...) -> SearchResult  # needs search shards
+client.step_stats(workflow, version=0) -> StepStats    # per-step duration and queue-wait percentiles
+client.backlog_coverage() -> BacklogCoverage           # ready work, and whether any worker would claim it
 ```
+
+## Step metadata and events
+
+Inside a handler, `wiggle.step` describes the running step and buffers domain events:
+
+```python
+from wiggle import step
+
+def ship(ctx):
+    step.emit("order.shipped", {"orderId": ctx["orderId"], "attempt": step.attempt()})
+    return ctx
+```
+
+An emitted event rides the step's report and is committed in the same transaction as the step: an
+attempt that raises leaves none behind, and its retry emits again. Consumers read emitted and
+lifecycle (`wf.*`) events through `client.poll_events` / `client.ack_events`. `step.name()` and
+`step.instance_id()` are available too. The worker reports each step's start and finish times, which
+feed `client.step_stats`.
 
 ## Versioning
 
@@ -275,13 +302,93 @@ unset unless you have a specific reason.
 > define the workflow in one place. (The Python content hash is its own — it does not equal the Java
 > client's number for the "same" workflow; cross-language interop is by activity name, not version.)
 
+## Branches created at run time
+
+A step declared with a `combine` is a **spawning step**: its handler may open branches with
+`wiggle.step.create(input, key=None)`, each running its own chain of steps on an isolated copy of
+`input`. The branches ride the step's report and commit with it. The combine then receives their
+results through `wiggle.step.results()`: a list in creation order, or a dict by key when every branch
+has one.
+
+```python
+from wiggle import Graph, Step, Worker, step
+
+flow = Graph("orders", [Step("fulfil", combine="summarise"), Step("notify")]).compile()
+
+def fulfil(order):
+    for item in order["items"]:
+        if item["digital"]:
+            step.create(item).then_accept("deliver-link", queue="digital")
+        else:
+            step.create(item, key=item["sku"]).then_apply("reserve").then_apply("ship")
+    return order
+
+def summarise(order):                      # the context is what fulfil returned
+    return {**order, "shipped": step.results()}
+
+worker = (Worker(client, "w1")
+          .branch_steps("orders", "deliver-link", "reserve", "ship")   # in no graph: bound on dispatch
+          .handle("orders", "fulfil", fulfil)
+          .handle_effect("orders", "deliver-link", deliver)
+          .handle("orders", "reserve", reserve)                    # step.base() is fulfil's return
+          .handle("orders", "ship", ship)
+          .handle_combine("orders", "summarise", summarise))
+```
+
+A branch offers `then_apply`, `then_accept`, `then_filter` (a false gate ends the branch), and
+`then_apply_compensable` with an undo bound by `handle_compensation`. It also offers
+`then_sleep`, `then_await(signal, timeout_s=, escalation=)`, `then_sub_flow(node, workflow)`,
+`then_all_of(*arms).combine(name)`, `repeat_while(condition, body, max_iterations=)` and
+`then_one_of(*arms)`, where each arm opens with `when(guard)` or, last, `otherwise()`:
+
+```python
+step.create(order).then_one_of(lambda a: a.when("bulk").then_apply("pallet"),
+                               lambda a: a.otherwise().then_apply("parcel"))
+```
+
+A step chained in a branch takes the
+creating step's queue and retry policy unless given its own. `.combine(name)` after a branch task
+makes that task spawn too, so branches nest. A combine may itself `create`, which starts another
+round.
+
+Branch-only steps are in no registered graph, so declare them with `Worker.branch_steps` (or a
+`branch_steps` attribute on a `register_handler` object). They are then bound by name the first time
+one is dispatched. A branch step on a queue no graph mentions runs only on a worker that polls that
+queue. Calling `step.create` anywhere but a spawning step or its combine fails the step.
+
+## Queue criteria
+
+A worker can claim only some of a queue's tasks: a predicate over the task's workflow, version,
+step, node, kind, attempt, correlation id, creation time (the fields of `Task_`), or **attributes**
+the workflow declares from its context (`Task_.attr(name)`).
+
+```python
+from wiggle import AttrType, Attribute, Graph, Step, Worker, criteria as c
+from wiggle.criteria import Task_
+
+flow = Graph("orders", [Step("charge", queue="payments")],
+             attributes=[Attribute("tier", AttrType.STRING, "customer.tier")]).compile()
+
+worker = Worker(client, "gold-1", criteria=[
+    c.QueueCriteria("payments", c.and_(c.equal(Task_.attr("tier"), "gold"), c.less_than(Task_.ATTEMPT, 3))),
+]).handle("orders", "charge", charge)
+```
+
+The operators are `equal`, `not_equal`, `in_`, `less_than(_or_equal_to)`, `greater_than(_or_equal_to)`,
+`between`, `like`, `is_null` and `is_not_null`, combined with `and_`, `or_` and `not_`. A comparison
+on an absent value is false. Criteria are checked against the server's limits when built.
+`criteria=` replaces `queues=`. `client.backlog_coverage()` shows ready work no live worker's criteria
+would claim.
+
 ## Tests
 
-Offline tests (no server needed) cover the topology graph shapes and the wire conversions:
+Offline tests (no server needed) cover the topology graph shapes and the wire conversions; the
+integration tests run every construct end to end against a server:
 
 ```bash
 pip install -e '.[dev]'
-pytest -q
+pytest -q                                              # integration tests skip without a server
+WIGGLE_TEST_URL=localhost:8080 pytest -q tests/
 ```
 
 ## Notes & limits

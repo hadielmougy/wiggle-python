@@ -13,18 +13,20 @@ signature rule here is unit-testable against a compiled graph (mirrors the Java 
 
 A method's return annotation picks its kind: ``-> bool`` binds a gate, ``-> None`` a side
 effect, anything else (or no annotation) a task whose return REPLACES the context. A method
-matched to a combine node returns the complete post-join context; ``wiggle.step.base()`` is
-made available inside it (the staged scratch keys excluded).
+matched to a combine node returns the complete post-join context.
+
+:func:`unstage` is the third pure operation: it turns a combine activation's context into the
+shape a combine handler takes, and computes the base ``wiggle.step.base()`` exposes inside it.
 """
 from __future__ import annotations
 
 import inspect
-import json
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from . import step as _step
+from .workflow import (ARM_SCRATCH_PREFIX, FOR_EACH_SCRATCH_PREFIX, SPAWN_SCRATCH_PREFIX,
+                       STEPS_SCRATCH_PREFIX)
 
 # tokens split on any non-alphanumeric run, and on camelCase / acronym boundaries
 _NON_ALNUM = re.compile(r"[^0-9A-Za-z]+")
@@ -111,15 +113,20 @@ def scan(handlers: object) -> dict[str, Candidate]:
     return found
 
 
-def bind(workflow: str, candidates: dict[str, Candidate], graph: dict) -> Result:
+def bind(workflow: str, candidates: dict[str, Candidate], graph: dict,
+         branch_steps: frozenset = frozenset()) -> Result:
     """Resolve an inventory against a compiled graph: each candidate is matched to a
     worker-dispatched step by canonical name and wrapped per the node's kind. A method matching no
-    step, or a kind clash, fails fast. Pure: no I/O, no worker state."""
+    step, or a kind clash, fails fast -- unless it implements one of ``branch_steps`` (canonical
+    names of steps only created branches run), which :func:`bind_created` binds on dispatch. Pure:
+    no I/O, no worker state."""
     nodes = {n["name"]: n for n in graph.get("nodes", [])
              if n.get("kind") in ("TASK", "PREDICATE") and "name" in n}
     by_canon: dict[str, tuple[str, dict]] = {}
     for name, node in nodes.items():
         by_canon.setdefault(canonical(name), (name, node))   # graph step names are already unique
+    candidates = {canon: cand for canon, cand in candidates.items()
+                  if canon in by_canon or _branch_target(canon, branch_steps) is None}
     # Partition out compensators first: a method named compensate_<step> (any case style) whose
     # canonical name matches no step directly is the undo of <step>. A step literally named
     # "compensate-x" keeps priority — its handler matches by_canon directly and stays a forward
@@ -150,7 +157,7 @@ def bind(workflow: str, candidates: dict[str, Candidate], graph: dict) -> Result
     # forward without its undo would strand the engine's reverse pass.
     for target, cand in compensators.items():
         step_name, node = by_canon[target]
-        if node["kind"] != "TASK" or node.get("itemsKey") or not node.get("compensable"):
+        if node["kind"] != "TASK" or is_combine(node) or not node.get("compensable"):
             raise ValueError(f"compensator '{cand.name}' targets step '{step_name}' of workflow "
                              f"'{workflow}', which is not declared compensate=True in the topology")
         bindings.append(Binding(f"{workflow}#{step_name}#compensate", step_name,
@@ -168,6 +175,34 @@ def bind(workflow: str, candidates: dict[str, Candidate], graph: dict) -> Result
     return Result(bindings, unserved)
 
 
+def _branch_target(canon: str, branch_steps: frozenset) -> Optional[str]:
+    """The branch step ``canon`` implements -- itself, or the step it undoes -- or None."""
+    if canon in branch_steps:
+        return canon
+    if canon.startswith("compensate") and canon[len("compensate"):] in branch_steps:
+        return canon[len("compensate"):]
+    return None
+
+
+def bind_created(workflow: str, candidates: dict[str, Candidate], step_name: str, kind: str,
+                 combine: bool, undo: bool) -> Optional[Callable]:
+    """The wrapper for a step a created branch runs -- in no graph, so matched by name on dispatch
+    -- or None when no method implements it. ``kind`` and ``combine`` describe the dispatched task;
+    ``undo`` asks for the step's compensator. Raises ``ValueError`` when the method's signature does
+    not fit the step, as :func:`bind` would."""
+    canon = canonical(step_name)
+    if undo:
+        cand = candidates.get("compensate" + canon)
+        return _compensation_wrapper(cand.method) if cand else None
+    cand = candidates.get(canon)
+    if cand is None:
+        return None
+    node = {"kind": kind}
+    if combine:
+        node["collectKey"] = "~"
+    return _wrapper_for(cand, node, f"{workflow}#{step_name}")
+
+
 def _compensation_wrapper(method: Callable) -> Callable:
     """Adapt a compensator method to the runtime handler shape: the engine stages the two
     snapshots as the activation context ``{"input": ..., "result": ...}``; split them out. The
@@ -178,20 +213,46 @@ def _compensation_wrapper(method: Callable) -> Callable:
     return wrapped
 
 
-def with_combine_base(wrapper: Callable, items_key_json: str) -> Callable:
-    """Wraps a combine handler so ``wiggle.step.base()`` works inside it: the base is the staged
-    context minus the scratch key(s) (a forEach's collected-results key, or a fork's arm names)."""
-    parsed = json.loads(items_key_json)
-    scratch_keys = [parsed] if isinstance(parsed, str) else list(parsed)
+def is_combine(node: dict) -> bool:
+    """Whether a registered graph node is a fork or forEach combine: a TASK with ``armNames`` or a
+    ``collectKey``, or -- in a graph written before those fields -- an ``itemsKey``."""
+    return node.get("kind") == "TASK" and bool(
+        node.get("armNames") or node.get("collectKey") or node.get("itemsKey"))
 
-    def wrapped(ctx):
-        base = {k: v for k, v in ctx.items() if k not in scratch_keys} if isinstance(ctx, dict) else ctx
-        token = _step._begin(base, 0, None, item=False)
-        try:
-            return wrapper(ctx)
-        finally:
-            _step._end(token)
-    return wrapped
+
+def unstage(ctx: Any, arm_names: list, collect_key: str, step_name: str) -> tuple[Any, Any, Any]:
+    """Rewrite a combine activation's context into the shape a combine handler takes, and return it
+    with the base (the context without the staged results) and the results themselves, which
+    ``wiggle.step.results()`` exposes. A fork's arms appear under their names and a forEach's
+    results under its name; created branches' results appear only through ``results()``, since
+    they have no name of their own. Raises ``ValueError`` when an arm or forEach name is also a key
+    of the workflow's own context, which the handler could not tell apart."""
+    if not isinstance(ctx, dict) or (not arm_names and not collect_key):
+        return ctx, None, None
+    base = dict(ctx)
+    placed = {}
+
+    def place(scratch: str, name: str) -> None:
+        if scratch not in base:
+            return
+        value = base.pop(scratch)
+        if name in base:
+            raise ValueError(f"combine '{step_name}': '{name}' is both a result to combine and a key "
+                             f"of the context; rename the branch or the key")
+        placed[name] = value
+
+    if arm_names:
+        for arm in arm_names:
+            place(ARM_SCRATCH_PREFIX + arm, arm)
+        return {**base, **placed}, base, dict(placed)
+    base.pop(STEPS_SCRATCH_PREFIX + collect_key, None)
+    if collect_key.startswith(SPAWN_SCRATCH_PREFIX):
+        results = base.pop(collect_key, [])
+        return base, base, results
+    name = collect_key[len(FOR_EACH_SCRATCH_PREFIX):] \
+        if collect_key.startswith(FOR_EACH_SCRATCH_PREFIX) else collect_key
+    place(collect_key, name)
+    return {**base, **placed}, base, placed.get(name)
 
 
 def _wrapper_for(cand: Candidate, node: dict, activity: str) -> Callable:
@@ -207,7 +268,7 @@ def _wrapper_for(cand: Candidate, node: dict, activity: str) -> Callable:
             raise ValueError(f"activity '{activity}' is a gate (PREDICATE) but handler "
                              f"'{cand.name}' is annotated to return {ret!r}; a gate must return bool")
         return lambda ctx: bool(method(ctx))
-    if node.get("itemsKey"):
+    if is_combine(node):
         # A fork/forEach combine: the return is the COMPLETE post-join context, sent verbatim (no
         # diff) -- the engine replaces the context with it; there is no implicit fold.
         if ret is bool or ret is None:
@@ -215,7 +276,7 @@ def _wrapper_for(cand: Candidate, node: dict, activity: str) -> Callable:
                              f"must return the complete post-join context (a dict), not {ret!r}")
         def combine_wrapper(ctx):
             return method(ctx)
-        return with_combine_base(combine_wrapper, node["itemsKey"])
+        return combine_wrapper
     # TASK node: task unless the method is a declared side effect (-> None), a bool is a mistake here
     if ret is bool:
         raise ValueError(f"activity '{activity}' is a TASK but handler '{cand.name}' is annotated "

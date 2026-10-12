@@ -17,19 +17,21 @@ from ._convert import from_value
 from . import step as _step
 from . import _binder
 from ._binder import Compensation  # noqa: F401  (re-exported: wiggle.Compensation)
-from .client import WiggleClient
-from .workflow import Activity, Predicate, SideEffect
+from .branch import BranchError
+from .client import ReportRefused, StepReport, WiggleClient
+from .criteria import QueueCriteria
+from .workflow import SPAWN_SCRATCH_PREFIX, Activity, Predicate, SideEffect
 
 log = logging.getLogger("wiggle.worker")
 
 
-class PermanentError(Exception):
+class PermanentActivityError(Exception):
     """Raise from a handler to fail the step without retrying (a bad request, not a blip)."""
 
 
 class Handlers:
     """Optional base for a class whose methods implement a workflow's steps -- one public method per
-    step, each taking the context. Register an instance with :meth:`Worker.register_handlers`.
+    step, each taking the context. Register an instance with :meth:`Worker.register_handler`.
 
     Method names match step names **regardless of case style**: ``in_stock``, ``inStock``, and a graph
     step named ``in-stock`` all normalise the same. The method's return annotation picks the kind:
@@ -37,10 +39,27 @@ class Handlers:
     task. Prefix helper methods with ``_`` so they are not treated as step handlers.
 
     Set the class attribute ``workflow`` to the workflow name these handlers implement, or pass
-    ``workflow=`` to :meth:`Worker.register_handlers`.
+    ``workflow=`` to :meth:`Worker.register_handler`.
     """
 
     workflow: Optional[str] = None
+
+
+def for_flow(workflow: str) -> Callable[[type], type]:
+    """Marks a class as the handler set for ``workflow``, as Java's ``@ForFlow`` does -- the same as
+    setting its ``workflow`` attribute:
+
+        @for_flow("orders")
+        class OrderHandlers:
+            def validate(self, ctx): ...
+    """
+    if not workflow:
+        raise ValueError("for_flow needs a workflow name")
+
+    def mark(cls: type) -> type:
+        cls.workflow = workflow
+        return cls
+    return mark
 
 
 _canonical = _binder.canonical   # re-exported: step-name folding lives in wiggle._binder
@@ -51,14 +70,21 @@ class Worker:
     registered separately (``client.register`` of a compiled :class:`Graph`, or the ``wiggle`` CLI).
 
     >>> worker = Worker(client, "worker-1").handle("order", "validate", validate)
-    >>> worker.start()          # background threads; call stop() to drain
+    >>> worker.start()          # background threads; call close() to drain
     """
 
     def __init__(self, client: WiggleClient, worker_id: str, *,
                  concurrency: Optional[int] = None, lease_s: float = 30.0,
                  long_poll_wait_s: float = 10.0, idle_backoff_s: float = 0.2,
                  error_backoff_s: float = 2.0, queues: Optional[Iterable[str]] = None,
-                 await_registration_s: float = 0.0):
+                 await_registration_s: float = 0.0,
+                 criteria: Optional[Iterable[QueueCriteria]] = None):
+        """``queues`` restricts the worker to those queues; ``criteria`` instead serves each
+        criteria's queue, claiming only the tasks its predicate holds for (see
+        :mod:`wiggle.criteria`). Set one or the other. Without either, the worker serves the queues
+        of the steps it binds."""
+        if queues and criteria:
+            raise ValueError(f"worker {worker_id}: pass queues or criteria, not both")
         self._client = client
         self.worker_id = worker_id
         self._concurrency = concurrency or os.cpu_count() or 4
@@ -67,12 +93,18 @@ class Worker:
         self._idle_backoff = idle_backoff_s
         self._error_backoff = error_backoff_s
         self._explicit_queues = set(queues) if queues else None
+        self._criteria = list(criteria or ())
+        if len({c.queue for c in self._criteria}) != len(self._criteria):
+            raise ValueError(f"worker {worker_id}: a queue has more than one criteria")
         self._await_registration_s = await_registration_s
 
         self._handlers: dict[str, Callable] = {}
         self._queues: set[str] = set()
         self._claims: list[tuple[str, str, str]] = []   # (workflow, step, expected NodeKind)
         self._handler_sets: list[tuple[str, dict[str, "_binder.Candidate"]]] = []  # (workflow, candidates)
+        self._branch_steps: dict[str, set[str]] = {}       # workflow -> canonical names
+        self._created_kinds: dict[str, str] = {}           # activity -> claimed kind, for branch steps
+        self._graphs: dict[tuple[str, int], dict] = {}     # (workflow, version) -> registered graph
         self._executor: Optional[ThreadPoolExecutor] = None
         self._poll_thread: Optional[threading.Thread] = None
         self._running = threading.Event()
@@ -127,7 +159,19 @@ class Worker:
             return None
         return self._bind(workflow, step, "TASK", wrapper)
 
-    def register_handlers(self, handlers: object, *, workflow: Optional[str] = None) -> "Worker":
+    def branch_steps(self, workflow: str, *steps: str) -> "Worker":
+        """Declare steps of ``workflow`` that only branches created at run time run
+        (``wiggle.step.create(...).then_apply(step)``), so they are in no registered graph. Their
+        handlers -- bound with :meth:`handle` and its siblings, or methods of a
+        :meth:`register_handler` object -- are then not matched against the graph on
+        :meth:`start`, but bound when such a step is first dispatched. A branch step on a queue
+        no graph mentions runs only on a worker that polls that queue (``queues=``/``criteria=``)."""
+        if not workflow or not steps:
+            raise ValueError("branch_steps needs a workflow and at least one step")
+        self._branch_steps.setdefault(workflow, set()).update(_binder.canonical(s) for s in steps)
+        return self
+
+    def register_handler(self, handlers: object, *, workflow: Optional[str] = None) -> "Worker":
         """Bind a whole object's methods as step handlers in one call. Each public method that takes a
         context becomes a handler; on :meth:`start` the worker matches it to a step of ``workflow`` by
         **case-insensitive name** (``in_stock``/``inStock`` both match a step named ``in-stock``) and
@@ -141,10 +185,13 @@ class Worker:
         """
         wf = workflow or getattr(handlers, "workflow", None)
         if not wf:
-            raise ValueError("register_handlers needs a workflow name: pass workflow=... or set a "
+            raise ValueError("register_handler needs a workflow name: pass workflow=... or set a "
                              "'workflow' attribute on the handlers object")
         candidates = _binder.scan(handlers)   # validates case-fold duplicates
         self._handler_sets.append((wf, candidates))
+        branch = getattr(handlers, "branch_steps", ())
+        if branch:
+            self.branch_steps(wf, *branch)
         return self
 
     def _bind(self, workflow: str, step: str, kind: str, wrapper: Callable) -> "Worker":
@@ -159,6 +206,8 @@ class Worker:
 
     @property
     def _served_queues(self) -> set[str]:
+        if self._criteria:
+            return {c.queue for c in self._criteria}
         return self._explicit_queues if self._explicit_queues is not None else self._queues
 
     def start(self) -> "Worker":
@@ -176,7 +225,7 @@ class Worker:
                  self.worker_id, sorted(self._served_queues), self._concurrency)
         return self
 
-    def stop(self, timeout_s: float = 10.0) -> None:
+    def close(self, timeout_s: float = 10.0) -> None:
         self._running.clear()
         if self._executor:
             self._executor.shutdown(wait=True, cancel_futures=False)
@@ -187,7 +236,7 @@ class Worker:
         return self.start()
 
     def __exit__(self, *exc) -> None:
-        self.stop()
+        self.close()
 
     def run_forever(self) -> None:
         """Start and block until interrupted (Ctrl-C)."""
@@ -198,7 +247,7 @@ class Worker:
         except KeyboardInterrupt:
             pass
         finally:
-            self.stop()
+            self.close()
 
     # ---- internals ----
 
@@ -212,28 +261,29 @@ class Worker:
             nodes = {n["activity"]: n for n in graph.get("nodes", [])
                      if n.get("kind") in ("TASK", "PREDICATE") and "activity" in n}
             served: set[str] = set()
+            branch = self._branch_steps.get(wf, set())
             for w, step, kind in self._claims:
                 if w != wf:
                     continue
                 activity = f"{w}#{step}"
                 node = nodes.get(activity)
+                if node is None and _binder.canonical(step) in branch:
+                    key = activity + "#compensate" if kind == "COMPENSATE" else activity
+                    self._created_kinds[key] = kind
+                    continue
                 if node is None:
                     avail = sorted(a.split("#", 1)[1] for a in nodes)
                     raise ValueError(f"no step '{step}' in registered workflow '{wf}' "
                                      f"(available steps: {avail})")
-                is_combine = node["kind"] == "TASK" and node.get("itemsKey")
+                is_combine = _binder.is_combine(node)
                 if kind == "COMPENSATE":
                     if node["kind"] != "TASK" or is_combine or not node.get("compensable"):
                         raise ValueError(f"step '{step}' of workflow '{wf}' is not declared "
                                          f"compensate=True in the topology; handle_compensation "
                                          f"binds only compensable steps")
-                elif kind == "COMBINE" and not is_combine:
-                    raise ValueError(f"activity '{activity}' is not a fork combine; bind it with handle()")
                 elif kind == "COMBINE":
-                    # Expose the frozen base ambiently inside the combine: wiggle.step.base() and
-                    # popping the scratch key from the raw dict are both valid access styles.
-                    self._handlers[activity] = _binder.with_combine_base(
-                        self._handlers[activity], node["itemsKey"])
+                    if not is_combine:
+                        raise ValueError(f"activity '{activity}' is not a fork combine; bind it with handle()")
                 elif is_combine:
                     raise ValueError(f"activity '{activity}' is a fork combine; bind it with "
                                      f"handle_combine() -- its return is the complete post-join "
@@ -250,7 +300,7 @@ class Worker:
             compensated = {step for w, step, kind in self._claims
                            if w == wf and kind == "COMPENSATE"}
             for w, step, kind in self._claims:
-                if w != wf or kind != "TASK" or step in compensated:
+                if w != wf or kind != "TASK" or step in compensated or f"{w}#{step}" not in nodes:
                     continue
                 node = nodes.get(f"{w}#{step}")
                 if node is not None and node.get("compensable"):
@@ -264,10 +314,10 @@ class Worker:
             self._match_handler_set(wf, candidates)
 
     def _match_handler_set(self, wf: str, candidates: dict[str, "_binder.Candidate"]) -> None:
-        """Match a :meth:`register_handlers` object's methods to ``wf``'s steps (fetched here — the
+        """Match a :meth:`register_handler` object's methods to ``wf``'s steps (fetched here — the
         binder itself is pure) and install the resulting bindings. See :mod:`wiggle._binder`."""
         graph = self._fetch_graph(wf)
-        result = _binder.bind(wf, candidates, graph)
+        result = _binder.bind(wf, candidates, graph, frozenset(self._branch_steps.get(wf, ())))
         for b in result.bindings:
             if b.activity in self._handlers:
                 raise ValueError(f"duplicate handler for activity '{b.activity}'")
@@ -282,7 +332,10 @@ class Worker:
         deadline = time.monotonic() + self._await_registration_s
         while True:
             try:
-                return self._client.get_workflow(workflow)
+                graph = self._client.get_workflow(workflow)
+                if "version" in graph:
+                    self._graphs[(workflow, int(graph["version"]))] = graph
+                return graph
             except grpc.RpcError as e:
                 not_found = e.code() == grpc.StatusCode.NOT_FOUND
                 if not_found and time.monotonic() < deadline:
@@ -310,8 +363,12 @@ class Worker:
         if free <= 0:
             self._running.wait(self._idle_backoff)
             return
-        result = self._client.poll(self.worker_id, self._served_queues, free,
-                                   self._lease_ms, self._wait_ms)
+        if self._criteria:
+            result = self._client.poll(self.worker_id, (), free, self._lease_ms, self._wait_ms,
+                                       criteria=self._criteria)
+        else:
+            result = self._client.poll(self.worker_id, self._served_queues, free,
+                                       self._lease_ms, self._wait_ms)
         if not result.tasks:
             # honour the server's backpressure hold-off if it is shedding load
             backoff = (result.retry_after_millis / 1000) if result.retry_after_millis > 0 else self._idle_backoff
@@ -330,34 +387,114 @@ class Worker:
                 self._inflight -= 1
 
     def _execute(self, task) -> None:
-        handler = self._handlers.get(task.activity)
+        try:
+            handler = self._handler_for(task)
+        except ValueError as e:   # a created step whose handler does not fit its kind
+            self._client.fail(task.task_id, task.lease_owner, str(e), retryable=False)
+            return
         if handler is None:
             self._client.fail(task.task_id, task.lease_owner,
                               f"no handler registered for activity '{task.activity}'", retryable=False)
             return
 
-        stop_heartbeat = self._start_heartbeat(task)
-        scope = None
-        if task.HasField("base_context"):
-            # A forEach item step: the handler's parameter is the ITEM's value (scalars included);
-            # the frozen base and the element's index/source key ride on wiggle.step.
-            scope = _step._begin(from_value(task.base_context), task.item_index,
-                                 task.item_map_key or None)
         try:
-            result = handler(from_value(task.context))
+            ctx, combine_base, results = _binder.unstage(from_value(task.context), list(task.arm_names),
+                                                         task.collect_key, task.step_name)
+        except ValueError as e:
+            self._client.fail(task.task_id, task.lease_owner, str(e), retryable=False)
+            return
+        stop_heartbeat = self._start_heartbeat(task)
+        # A forEach item step's parameter is the ITEM's value (scalars included); the frozen base and
+        # the element's index/source key ride on wiggle.step. A combine's base rides there too.
+        item = task.HasField("base_context")
+        base = from_value(task.base_context) if item else combine_base
+        scope = _step._begin(_step._Scope(
+            attempt=task.attempt, name=task.step_name, instance_id=task.instance_id,
+            base=base, has_base=item or combine_base is not None, item=item,
+            index=task.item_index, map_key=task.item_map_key or None,
+            creates_branches=self._creates_branches(task),
+            results=results, has_results=combine_base is not None))
+        started_at = int(time.time() * 1000)
+        t0 = time.monotonic()
+        try:
+            try:
+                result = handler(ctx)
+            finally:
+                emitted = list(_step._current().emitted)
+                created = list(_step._current().created)
+                _step._end(scope)
+            stop_heartbeat.set()
+            report = StepReport(task.node_id, started_at=started_at,
+                                finished_at=started_at + int((time.monotonic() - t0) * 1000),
+                                events=emitted, branches=created)
             if task.kind == "PREDICATE":
-                self._client.complete(task.task_id, task.lease_owner, {"value": bool(result)})
+                if not isinstance(result, bool):
+                    self._client.fail(task.task_id, task.lease_owner,
+                                      f"predicate '{task.step_name}' returned "
+                                      f"{type(result).__name__}", retryable=False)
+                    return
+                report.predicate = result
             else:
-                self._client.complete(task.task_id, task.lease_owner, result)
-        except PermanentError as e:
+                report.merge = result
+            try:
+                self._client.report_steps(task.task_id, task.lease_owner, [report])
+            except ReportRefused as e:   # the lease was lost; the task re-runs elsewhere
+                log.warning("%s", e)
+        except (PermanentActivityError, BranchError) as e:
             self._client.fail(task.task_id, task.lease_owner, str(e), retryable=False)
         except Exception as e:  # noqa: BLE001 - a handler failure is a step failure, retried
             log.debug("step %s of %s failed: %s", task.step_name, task.instance_id, e)
             self._client.fail(task.task_id, task.lease_owner, f"{type(e).__name__}: {e}", retryable=True)
         finally:
-            if scope is not None:
-                _step._end(scope)
             stop_heartbeat.set()
+
+    def _handler_for(self, task) -> Optional[Callable]:
+        """The handler for ``task``. A step on a created node (id ``~...``) is in no graph, so it
+        binds by name on first dispatch -- from a :meth:`handle` binding of a declared branch step,
+        or a method of a :meth:`register_handler` object -- and so does its undo, which may run on
+        a worker that never ran the step."""
+        handler = self._handlers.get(task.activity)
+        if not task.node_id.startswith("~"):
+            return handler
+        undo = task.activity.endswith("#compensate")
+        combine = bool(task.collect_key or task.arm_names)
+        kind = "COMPENSATE" if undo else "COMBINE" if combine else task.kind
+        if handler is not None:
+            claimed = self._created_kinds.get(task.activity)
+            if claimed is not None and claimed != kind:
+                raise ValueError(f"step '{task.step_name}' runs as a {kind} but its handler was bound "
+                                 f"as a {claimed}")
+            return handler
+        workflow, _, rest = task.activity.partition("#")
+        name = rest[:-len("#compensate")] if undo else rest
+        for wf, candidates in self._handler_sets:
+            if wf != workflow:
+                continue
+            bound = _binder.bind_created(wf, candidates, name, "TASK" if undo else task.kind,
+                                         combine and not undo, undo)
+            if bound is not None:
+                with self._lock:
+                    self._handlers.setdefault(task.activity, bound)
+                return bound
+        return None
+
+    def _creates_branches(self, task) -> bool:
+        """Whether ``task`` may call ``wiggle.step.create``: a spawning step or its combine. A node
+        this worker does not hold -- a created one, or another version's -- is left to the server."""
+        if task.collect_key.startswith(SPAWN_SCRATCH_PREFIX):
+            return True
+        graph = self._graphs.get((task.workflow, task.version))
+        if graph is None or task.node_id.startswith("~"):
+            return True
+        nodes = {n["id"]: n for n in graph.get("nodes", [])}
+        node = nodes.get(task.node_id)
+        if node is None or node.get("kind") != "TASK" or _binder.is_combine(node):
+            return False
+        join = nodes.get(node.get("next"))
+        if join is None or join.get("kind") != "JOIN" or join.get("expected") or "next" not in join:
+            return False
+        combine = nodes.get(join["next"])
+        return combine is not None and combine.get("collectKey") == SPAWN_SCRATCH_PREFIX + node["name"]
 
     def _start_heartbeat(self, task) -> threading.Event:
         """Extend the lease periodically while a handler runs, so a slow step keeps its claim."""
