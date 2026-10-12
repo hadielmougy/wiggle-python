@@ -25,7 +25,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from .workflow import ARM_SCRATCH_PREFIX, FOR_EACH_SCRATCH_PREFIX, STEPS_SCRATCH_PREFIX
+from .workflow import (ARM_SCRATCH_PREFIX, FOR_EACH_SCRATCH_PREFIX, SPAWN_SCRATCH_PREFIX,
+                       STEPS_SCRATCH_PREFIX)
 
 # tokens split on any non-alphanumeric run, and on camelCase / acronym boundaries
 _NON_ALNUM = re.compile(r"[^0-9A-Za-z]+")
@@ -112,15 +113,20 @@ def scan(handlers: object) -> dict[str, Candidate]:
     return found
 
 
-def bind(workflow: str, candidates: dict[str, Candidate], graph: dict) -> Result:
+def bind(workflow: str, candidates: dict[str, Candidate], graph: dict,
+         branch_steps: frozenset = frozenset()) -> Result:
     """Resolve an inventory against a compiled graph: each candidate is matched to a
     worker-dispatched step by canonical name and wrapped per the node's kind. A method matching no
-    step, or a kind clash, fails fast. Pure: no I/O, no worker state."""
+    step, or a kind clash, fails fast -- unless it implements one of ``branch_steps`` (canonical
+    names of steps only created branches run), which :func:`bind_created` binds on dispatch. Pure:
+    no I/O, no worker state."""
     nodes = {n["name"]: n for n in graph.get("nodes", [])
              if n.get("kind") in ("TASK", "PREDICATE") and "name" in n}
     by_canon: dict[str, tuple[str, dict]] = {}
     for name, node in nodes.items():
         by_canon.setdefault(canonical(name), (name, node))   # graph step names are already unique
+    candidates = {canon: cand for canon, cand in candidates.items()
+                  if canon in by_canon or _branch_target(canon, branch_steps) is None}
     # Partition out compensators first: a method named compensate_<step> (any case style) whose
     # canonical name matches no step directly is the undo of <step>. A step literally named
     # "compensate-x" keeps priority — its handler matches by_canon directly and stays a forward
@@ -169,6 +175,34 @@ def bind(workflow: str, candidates: dict[str, Candidate], graph: dict) -> Result
     return Result(bindings, unserved)
 
 
+def _branch_target(canon: str, branch_steps: frozenset) -> Optional[str]:
+    """The branch step ``canon`` implements -- itself, or the step it undoes -- or None."""
+    if canon in branch_steps:
+        return canon
+    if canon.startswith("compensate") and canon[len("compensate"):] in branch_steps:
+        return canon[len("compensate"):]
+    return None
+
+
+def bind_created(workflow: str, candidates: dict[str, Candidate], step_name: str, kind: str,
+                 combine: bool, undo: bool) -> Optional[Callable]:
+    """The wrapper for a step a created branch runs -- in no graph, so matched by name on dispatch
+    -- or None when no method implements it. ``kind`` and ``combine`` describe the dispatched task;
+    ``undo`` asks for the step's compensator. Raises ``ValueError`` when the method's signature does
+    not fit the step, as :func:`bind` would."""
+    canon = canonical(step_name)
+    if undo:
+        cand = candidates.get("compensate" + canon)
+        return _compensation_wrapper(cand.method) if cand else None
+    cand = candidates.get(canon)
+    if cand is None:
+        return None
+    node = {"kind": kind}
+    if combine:
+        node["collectKey"] = "~"
+    return _wrapper_for(cand, node, f"{workflow}#{step_name}")
+
+
 def _compensation_wrapper(method: Callable) -> Callable:
     """Adapt a compensator method to the runtime handler shape: the engine stages the two
     snapshots as the activation context ``{"input": ..., "result": ...}``; split them out. The
@@ -186,13 +220,15 @@ def is_combine(node: dict) -> bool:
         node.get("armNames") or node.get("collectKey") or node.get("itemsKey"))
 
 
-def unstage(ctx: Any, arm_names: list, collect_key: str, step_name: str) -> tuple[Any, Any]:
-    """Rewrite a combine activation's context into the shape a combine handler takes -- each fork
-    arm's result under the arm's name, or a forEach's results under the forEach's name -- and
-    return it with the base (the context without them). Raises ``ValueError`` when such a name is
-    also a key of the workflow's own context, which the handler could not tell apart."""
+def unstage(ctx: Any, arm_names: list, collect_key: str, step_name: str) -> tuple[Any, Any, Any]:
+    """Rewrite a combine activation's context into the shape a combine handler takes, and return it
+    with the base (the context without the staged results) and the results themselves, which
+    ``wiggle.step.results()`` exposes. A fork's arms appear under their names and a forEach's
+    results under its name; created branches' results appear only through ``results()``, since
+    they have no name of their own. Raises ``ValueError`` when an arm or forEach name is also a key
+    of the workflow's own context, which the handler could not tell apart."""
     if not isinstance(ctx, dict) or (not arm_names and not collect_key):
-        return ctx, None
+        return ctx, None, None
     base = dict(ctx)
     placed = {}
 
@@ -205,14 +241,18 @@ def unstage(ctx: Any, arm_names: list, collect_key: str, step_name: str) -> tupl
                              f"of the context; rename the branch or the key")
         placed[name] = value
 
-    for arm in arm_names:
-        place(ARM_SCRATCH_PREFIX + arm, arm)
-    if collect_key:
-        base.pop(STEPS_SCRATCH_PREFIX + collect_key, None)
-        name = collect_key[len(FOR_EACH_SCRATCH_PREFIX):] \
-            if collect_key.startswith(FOR_EACH_SCRATCH_PREFIX) else collect_key
-        place(collect_key, name)
-    return {**base, **placed}, base
+    if arm_names:
+        for arm in arm_names:
+            place(ARM_SCRATCH_PREFIX + arm, arm)
+        return {**base, **placed}, base, dict(placed)
+    base.pop(STEPS_SCRATCH_PREFIX + collect_key, None)
+    if collect_key.startswith(SPAWN_SCRATCH_PREFIX):
+        results = base.pop(collect_key, [])
+        return base, base, results
+    name = collect_key[len(FOR_EACH_SCRATCH_PREFIX):] \
+        if collect_key.startswith(FOR_EACH_SCRATCH_PREFIX) else collect_key
+    place(collect_key, name)
+    return {**base, **placed}, base, placed.get(name)
 
 
 def _wrapper_for(cand: Candidate, node: dict, activity: str) -> Callable:

@@ -18,7 +18,8 @@ from .client import (
     WiggleClient,
 )
 from .worker import Compensation, Handlers, PermanentError, Worker
-from . import step  # noqa: F401  (wiggle.step.base() et al.)
+from . import criteria, step  # noqa: F401  (wiggle.step.create() et al., wiggle.criteria)
+from .branch import Branch as CreatedBranch, BranchError, otherwise, when
 from .workflow import (
     AwaitSignal,
     FlowSpec,
@@ -30,6 +31,7 @@ from .workflow import (
     Fork,
     ForEach,
     Gate,
+    Attribute,
     Graph,
     Node,
     Retry,
@@ -64,6 +66,12 @@ __all__ = [
     "StepStats",
     "BacklogCoverage",
     "ReportRefused",
+    "Attribute",
+    "CreatedBranch",
+    "BranchError",
+    "when",
+    "otherwise",
+    "criteria",
     "Worker",
     "Handlers",
     "PermanentError",

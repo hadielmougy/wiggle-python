@@ -5,15 +5,19 @@ from __future__ import annotations
 
 import logging
 import time
+from decimal import Decimal
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Union
 
 import grpc
 from google.protobuf import json_format, struct_pb2
 
+from . import criteria as _crit
 from ._convert import from_value, to_value
 from ._proto import wiggle_pb2 as pb
 from ._proto import wiggle_pb2_grpc as rpc
+from .branch import Branch
+from .criteria import QueueCriteria
 from .workflow import FlowSpec
 
 # COMPENSATING is NOT terminal: the reverse pass is still running its compensators; it settles
@@ -153,14 +157,15 @@ class BacklogCoverage:
 @dataclass
 class StepReport:
     """One finished step, as a worker reports it: exactly one of ``merge`` (a task's complete next
-    context; ``None`` leaves it unchanged) or ``predicate`` (a predicate's branch), with when it ran
-    and the events it emitted as ``(type, payload)`` pairs."""
+    context; ``None`` leaves it unchanged) or ``predicate`` (a predicate's branch), with when it ran,
+    the events it emitted as ``(type, payload)`` pairs, and the branches it created."""
     node_id: str
     merge: Any = None
     predicate: Optional[bool] = None
     started_at: int = 0
     finished_at: int = 0
     events: list = field(default_factory=list)
+    branches: list = field(default_factory=list)
 
 
 @dataclass
@@ -369,13 +374,22 @@ class WiggleClient:
 
     def poll(self, worker_id: str, queues: Iterable[str], max_tasks: int,
              lease_millis: int, wait_millis: int,
-             versions: Iterable[tuple[str, int]] = ()) -> pb.TaskList:
-        """Claim up to ``max_tasks`` ready tasks on ``queues``. A non-empty ``versions`` -- (workflow,
-        version) pairs -- claims only those versions' tasks."""
+             versions: Iterable[tuple[str, int]] = (),
+             criteria: Iterable[QueueCriteria] = ()) -> pb.TaskList:
+        """Claim up to ``max_tasks`` ready tasks on ``queues`` -- or, with ``criteria``, on each
+        criteria's queue where its predicate holds (then ``queues`` must be empty). A non-empty
+        ``versions`` -- (workflow, version) pairs -- claims only those versions' tasks."""
+        criteria = list(criteria)
+        queues = list(queues)
+        if criteria and queues:
+            raise ValueError("poll with queues or with criteria, not both")
+        if len({c.queue for c in criteria}) != len(criteria):
+            raise ValueError("a queue has more than one criteria")
         return self._stub.PollTasks(pb.PollRequest(
-            worker_id=worker_id, queues=list(queues), max=max_tasks,
+            worker_id=worker_id, queues=queues, max=max_tasks,
             lease_millis=lease_millis, wait_millis=wait_millis,
-            versions=[pb.WorkflowVersion(workflow=w, version=v) for w, v in versions]),
+            versions=[pb.WorkflowVersion(workflow=w, version=v) for w, v in versions],
+            criteria=[_criteria(c) for c in criteria]),
             wait_for_ready=self._wfr)
 
     def report_steps(self, task_id: str, lease_owner: str, steps: list[StepReport],
@@ -407,12 +421,63 @@ class WiggleClient:
 
 def _step_result(s: StepReport) -> pb.StepResult:
     r = pb.StepResult(node_id=s.node_id, started_at=s.started_at, finished_at=s.finished_at,
-                      events=[pb.EmittedEvent(type=t, payload=to_value(p)) for t, p in s.events])
+                      events=[pb.EmittedEvent(type=t, payload=to_value(p)) for t, p in s.events],
+                      branches=[_created_branch(b) for b in s.branches])
     if s.predicate is not None:
         r.predicate_value = s.predicate
     elif s.merge is not None:
         r.merge.CopyFrom(to_value(s.merge))
     return r
+
+
+def _created_branch(b: Branch) -> pb.CreatedBranch:
+    return pb.CreatedBranch(input=to_value(b.input), key=b.key or "",
+                            steps=[_branch_step(st) for st in b.steps])
+
+
+def _branch_step(st: dict) -> pb.BranchStep:
+    out = pb.BranchStep(
+        name=st.get("name", ""), kind=st["kind"], compensable=st.get("compensable", False),
+        queue=st.get("queue", ""), sleep_millis=st.get("sleep_millis", 0),
+        combine=st.get("combine", ""), workflow=st.get("workflow", ""),
+        escalation=[_branch_step(e) for e in st.get("escalation", ())],
+        arms=[pb.BranchArm(steps=[_branch_step(a) for a in arm]) for arm in st.get("arms", ())],
+        body=[_branch_step(b) for b in st.get("body", ())],
+        loop_budget=st.get("loop_budget", 0),
+        cases=[pb.BranchCase(guard=g or "", steps=[_branch_step(c) for c in steps])
+               for g, steps in st.get("cases", ())])
+    if "retry" in st:
+        out.retry.CopyFrom(to_value(st["retry"]))
+    return out
+
+
+def _criteria(c: QueueCriteria) -> pb.QueueCriteria:
+    out = pb.QueueCriteria(queue=c.queue)
+    if c.where is not None:
+        out.where.CopyFrom(_predicate(c.where))
+    return out
+
+
+def _predicate(p: _crit.Predicate) -> pb.CriteriaPredicate:
+    if isinstance(p, _crit.Comparison):
+        cmp = pb.CriteriaComparison(field=p.field.name, op=p.op, attribute=p.field.attribute or "",
+                                    args=[_literal(a) for a in p.args])
+        return pb.CriteriaPredicate(cmp=cmp)
+    if isinstance(p, _crit.And):
+        return pb.CriteriaPredicate(all_of=pb.CriteriaJunction(terms=[_predicate(t) for t in p.terms]))
+    if isinstance(p, _crit.Or):
+        return pb.CriteriaPredicate(any_of=pb.CriteriaJunction(terms=[_predicate(t) for t in p.terms]))
+    return pb.CriteriaPredicate(negated=_predicate(p.term))
+
+
+def _literal(a: Any) -> pb.CriteriaLiteral:
+    if isinstance(a, bool):
+        return pb.CriteriaLiteral(flag=a)
+    if isinstance(a, int):
+        return pb.CriteriaLiteral(integer=a)
+    if isinstance(a, Decimal):
+        return pb.CriteriaLiteral(decimal=format(a, "f"))
+    return pb.CriteriaLiteral(text=a)
 
 
 def _event(e: pb.EventView) -> EventView:
