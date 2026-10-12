@@ -51,6 +51,11 @@ class WiggleControlPlaneStub:
                 request_serializer=wiggle__pb2.Empty.SerializeToString,
                 response_deserializer=wiggle__pb2.WorkflowNames.FromString,
                 _registered_method=True)
+        self.GetBacklogCoverage = channel.unary_unary(
+                '/com.wiggle.proto.WiggleControlPlane/GetBacklogCoverage',
+                request_serializer=wiggle__pb2.BacklogCoverageRequest.SerializeToString,
+                response_deserializer=wiggle__pb2.BacklogCoverage.FromString,
+                _registered_method=True)
         self.RegisterWorkflow = channel.unary_unary(
                 '/com.wiggle.proto.WiggleControlPlane/RegisterWorkflow',
                 request_serializer=wiggle__pb2.WorkflowDefinition.SerializeToString,
@@ -106,10 +111,10 @@ class WiggleControlPlaneStub:
                 request_serializer=wiggle__pb2.PollRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.TaskList.FromString,
                 _registered_method=True)
-        self.CompleteTask = channel.unary_unary(
-                '/com.wiggle.proto.WiggleControlPlane/CompleteTask',
-                request_serializer=wiggle__pb2.TaskResultRequest.SerializeToString,
-                response_deserializer=wiggle__pb2.Ack.FromString,
+        self.ReportSteps = channel.unary_unary(
+                '/com.wiggle.proto.WiggleControlPlane/ReportSteps',
+                request_serializer=wiggle__pb2.ReportStepsRequest.SerializeToString,
+                response_deserializer=wiggle__pb2.ReportStepsResult.FromString,
                 _registered_method=True)
         self.FailTask = channel.unary_unary(
                 '/com.wiggle.proto.WiggleControlPlane/FailTask',
@@ -121,10 +126,25 @@ class WiggleControlPlaneStub:
                 request_serializer=wiggle__pb2.HeartbeatRequest.SerializeToString,
                 response_deserializer=wiggle__pb2.HeartbeatResult.FromString,
                 _registered_method=True)
-        self.AdvanceRun = channel.unary_unary(
-                '/com.wiggle.proto.WiggleControlPlane/AdvanceRun',
-                request_serializer=wiggle__pb2.AdvanceRunRequest.SerializeToString,
-                response_deserializer=wiggle__pb2.AdvanceRunResult.FromString,
+        self.PollEvents = channel.unary_unary(
+                '/com.wiggle.proto.WiggleControlPlane/PollEvents',
+                request_serializer=wiggle__pb2.PollEventsRequest.SerializeToString,
+                response_deserializer=wiggle__pb2.EventList.FromString,
+                _registered_method=True)
+        self.AckEvents = channel.unary_unary(
+                '/com.wiggle.proto.WiggleControlPlane/AckEvents',
+                request_serializer=wiggle__pb2.AckEventsRequest.SerializeToString,
+                response_deserializer=wiggle__pb2.Ack.FromString,
+                _registered_method=True)
+        self.GetStepStats = channel.unary_unary(
+                '/com.wiggle.proto.WiggleControlPlane/GetStepStats',
+                request_serializer=wiggle__pb2.StepStatsRequest.SerializeToString,
+                response_deserializer=wiggle__pb2.StepStats.FromString,
+                _registered_method=True)
+        self.SearchInstances = channel.unary_unary(
+                '/com.wiggle.proto.WiggleControlPlane/SearchInstances',
+                request_serializer=wiggle__pb2.SearchRequest.SerializeToString,
+                response_deserializer=wiggle__pb2.SearchResult.FromString,
                 _registered_method=True)
 
 
@@ -147,6 +167,14 @@ class WiggleControlPlaneServicer:
 
     def ListWorkflows(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetBacklogCoverage(self, request, context):
+        """Dispatchable work split by (workflow, version, queue), each flagged with whether any worker
+        polling this node would claim it. An uncovered slice is work nothing can pick up.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -218,8 +246,12 @@ class WiggleControlPlaneServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def CompleteTask(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+    def ReportSteps(self, request, context):
+        """The one way a worker reports finished work: one run of steps, or several independent runs
+        applied in a single commit. The server resolves each workflow's execution mode and decides
+        from it whether the continuation is leased back to this worker or released -- the client
+        never chooses that, so it cannot choose wrong. Answers are per run, keyed by task id.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -236,9 +268,31 @@ class WiggleControlPlaneServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def AdvanceRun(self, request, context):
-        """Applies an ordered run of locally-executed steps atomically, keeps the lease, and reports
-        whether the worker should keep going (LOCAL_SYNC / LOCAL_ASYNC execution).
+    def PollEvents(self, request, context):
+        """The event feed: pull-and-ack over the durable event log. A consumer is a named cursor;
+        PollEvents long-polls like PollTasks and merges every shard's log, AckEvents advances the
+        cursor to the one an entry carries.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AckEvents(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetStepStats(self, request, context):
+        """Per-node duration statistics over recently settled steps of one workflow version.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SearchInstances(self, request, context):
+        """Full-text search over instances, across every search shard; FAILED_PRECONDITION when search is
+        not enabled. Hits are limited to the workflows the caller may read.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -261,6 +315,11 @@ def add_WiggleControlPlaneServicer_to_server(servicer, server):
                     servicer.ListWorkflows,
                     request_deserializer=wiggle__pb2.Empty.FromString,
                     response_serializer=wiggle__pb2.WorkflowNames.SerializeToString,
+            ),
+            'GetBacklogCoverage': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetBacklogCoverage,
+                    request_deserializer=wiggle__pb2.BacklogCoverageRequest.FromString,
+                    response_serializer=wiggle__pb2.BacklogCoverage.SerializeToString,
             ),
             'RegisterWorkflow': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterWorkflow,
@@ -317,10 +376,10 @@ def add_WiggleControlPlaneServicer_to_server(servicer, server):
                     request_deserializer=wiggle__pb2.PollRequest.FromString,
                     response_serializer=wiggle__pb2.TaskList.SerializeToString,
             ),
-            'CompleteTask': grpc.unary_unary_rpc_method_handler(
-                    servicer.CompleteTask,
-                    request_deserializer=wiggle__pb2.TaskResultRequest.FromString,
-                    response_serializer=wiggle__pb2.Ack.SerializeToString,
+            'ReportSteps': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReportSteps,
+                    request_deserializer=wiggle__pb2.ReportStepsRequest.FromString,
+                    response_serializer=wiggle__pb2.ReportStepsResult.SerializeToString,
             ),
             'FailTask': grpc.unary_unary_rpc_method_handler(
                     servicer.FailTask,
@@ -332,10 +391,25 @@ def add_WiggleControlPlaneServicer_to_server(servicer, server):
                     request_deserializer=wiggle__pb2.HeartbeatRequest.FromString,
                     response_serializer=wiggle__pb2.HeartbeatResult.SerializeToString,
             ),
-            'AdvanceRun': grpc.unary_unary_rpc_method_handler(
-                    servicer.AdvanceRun,
-                    request_deserializer=wiggle__pb2.AdvanceRunRequest.FromString,
-                    response_serializer=wiggle__pb2.AdvanceRunResult.SerializeToString,
+            'PollEvents': grpc.unary_unary_rpc_method_handler(
+                    servicer.PollEvents,
+                    request_deserializer=wiggle__pb2.PollEventsRequest.FromString,
+                    response_serializer=wiggle__pb2.EventList.SerializeToString,
+            ),
+            'AckEvents': grpc.unary_unary_rpc_method_handler(
+                    servicer.AckEvents,
+                    request_deserializer=wiggle__pb2.AckEventsRequest.FromString,
+                    response_serializer=wiggle__pb2.Ack.SerializeToString,
+            ),
+            'GetStepStats': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetStepStats,
+                    request_deserializer=wiggle__pb2.StepStatsRequest.FromString,
+                    response_serializer=wiggle__pb2.StepStats.SerializeToString,
+            ),
+            'SearchInstances': grpc.unary_unary_rpc_method_handler(
+                    servicer.SearchInstances,
+                    request_deserializer=wiggle__pb2.SearchRequest.FromString,
+                    response_serializer=wiggle__pb2.SearchResult.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -421,6 +495,33 @@ class WiggleControlPlane:
             '/com.wiggle.proto.WiggleControlPlane/ListWorkflows',
             wiggle__pb2.Empty.SerializeToString,
             wiggle__pb2.WorkflowNames.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetBacklogCoverage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/com.wiggle.proto.WiggleControlPlane/GetBacklogCoverage',
+            wiggle__pb2.BacklogCoverageRequest.SerializeToString,
+            wiggle__pb2.BacklogCoverage.FromString,
             options,
             channel_credentials,
             insecure,
@@ -729,7 +830,7 @@ class WiggleControlPlane:
             _registered_method=True)
 
     @staticmethod
-    def CompleteTask(request,
+    def ReportSteps(request,
             target,
             options=(),
             channel_credentials=None,
@@ -742,9 +843,9 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/com.wiggle.proto.WiggleControlPlane/CompleteTask',
-            wiggle__pb2.TaskResultRequest.SerializeToString,
-            wiggle__pb2.Ack.FromString,
+            '/com.wiggle.proto.WiggleControlPlane/ReportSteps',
+            wiggle__pb2.ReportStepsRequest.SerializeToString,
+            wiggle__pb2.ReportStepsResult.FromString,
             options,
             channel_credentials,
             insecure,
@@ -810,7 +911,7 @@ class WiggleControlPlane:
             _registered_method=True)
 
     @staticmethod
-    def AdvanceRun(request,
+    def PollEvents(request,
             target,
             options=(),
             channel_credentials=None,
@@ -823,9 +924,90 @@ class WiggleControlPlane:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/com.wiggle.proto.WiggleControlPlane/AdvanceRun',
-            wiggle__pb2.AdvanceRunRequest.SerializeToString,
-            wiggle__pb2.AdvanceRunResult.FromString,
+            '/com.wiggle.proto.WiggleControlPlane/PollEvents',
+            wiggle__pb2.PollEventsRequest.SerializeToString,
+            wiggle__pb2.EventList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AckEvents(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/com.wiggle.proto.WiggleControlPlane/AckEvents',
+            wiggle__pb2.AckEventsRequest.SerializeToString,
+            wiggle__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetStepStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/com.wiggle.proto.WiggleControlPlane/GetStepStats',
+            wiggle__pb2.StepStatsRequest.SerializeToString,
+            wiggle__pb2.StepStats.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SearchInstances(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/com.wiggle.proto.WiggleControlPlane/SearchInstances',
+            wiggle__pb2.SearchRequest.SerializeToString,
+            wiggle__pb2.SearchResult.FromString,
             options,
             channel_credentials,
             insecure,

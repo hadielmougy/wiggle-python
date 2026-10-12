@@ -26,9 +26,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
+
+# The engine stages a join's results under reserved keys so they cannot collide with the workflow's
+# own data: a fork arm under ARM_SCRATCH_PREFIX + arm, a forEach's collected results under the
+# combine's collectKey -- FOR_EACH_SCRATCH_PREFIX + name for a forEach, SPAWN_SCRATCH_PREFIX + step for
+# branches a step created -- and the step that produced each result under STEPS_SCRATCH_PREFIX + collectKey.
+ARM_SCRATCH_PREFIX = "__arm__"
+FOR_EACH_SCRATCH_PREFIX = "__forEach__"
+SPAWN_SCRATCH_PREFIX = "__spawn__"
+STEPS_SCRATCH_PREFIX = "__steps__"
 
 _MAX_INT = 2_147_483_647
 
@@ -89,12 +99,18 @@ class Step(Node):
     ``compensate=True`` declares the step compensable: if the instance later fails, the engine
     runs the step's compensator (bound with ``Worker.handle_compensation`` or a
     ``compensate_<step>`` method on a handlers object) in the reverse pass, handing it the
-    input/result context snapshots captured at this step's completion."""
+    input/result context snapshots captured at this step's completion.
+
+    ``combine`` makes the step a spawning step: its handler may ``wiggle.step.create`` branches,
+    and the combine step ``combine`` (bound with ``Worker.handle_combine``) receives their results
+    under this step's name and returns the post-join context. The combine always runs, with an
+    empty collection when the step created nothing, and may itself create the next round."""
 
     name: str
     queue: Optional[str] = None      # None -> the default queue
     retry: Optional[Retry] = None    # None -> default (retry forever)
     compensate: bool = False         # declare an undo; a compensator MUST be bound for this step
+    combine: str = ""                # a spawning step: the combine its created branches rejoin at
 
 
 @dataclass
@@ -102,12 +118,13 @@ class Effect(Node):
     """A step run for its side effect only; the context is unchanged. Bind it with
     ``Worker.handle_effect``. (Topologically identical to a :class:`Step`.) ``compensate``
     declares an undo exactly as on a :class:`Step` (for an effect the two snapshots are the
-    same context)."""
+    same context). ``combine`` makes it a spawning step, as on a :class:`Step`."""
 
     name: str
     queue: Optional[str] = None
     retry: Optional[Retry] = None
     compensate: bool = False
+    combine: str = ""
 
 
 @dataclass
@@ -235,6 +252,35 @@ class FlowSpec:
     queues: list[str]
 
 
+_ATTRIBUTE_NAME = re.compile(r"[a-z][a-z0-9_]{0,62}")
+_ATTRIBUTE_TYPES = ("STRING", "LONG", "DECIMAL", "BOOLEAN")
+MAX_ATTRIBUTES = 16
+
+
+@dataclass(frozen=True)
+class Attribute:
+    """A value the workflow declares for queue criteria to test (``wiggle.criteria.attr(name)``):
+    ``path`` is a dotted path into the context a step receives, read as ``type`` -- ``STRING``,
+    ``LONG``, ``DECIMAL`` or ``BOOLEAN``. The server extracts it each time a step becomes ready; a
+    value that is missing or does not fit the type is absent."""
+
+    name: str
+    type: str
+    path: str
+
+    def __post_init__(self):
+        if not _ATTRIBUTE_NAME.fullmatch(self.name or ""):
+            raise ValueError(f"attribute name '{self.name}' must match {_ATTRIBUTE_NAME.pattern}")
+        if self.type not in _ATTRIBUTE_TYPES:
+            raise ValueError(f"attribute '{self.name}' type must be one of {_ATTRIBUTE_TYPES}, "
+                             f"got {self.type!r}")
+        if not self.path or "" in self.path.split("."):
+            raise ValueError(f"attribute '{self.name}' needs a dotted path, got '{self.path}'")
+
+    def to_json(self) -> dict:
+        return {"name": self.name, "type": self.type, "path": self.path}
+
+
 @dataclass
 class Graph:
     """A workflow's topology as declarative data. ``compile()`` validates the shape and turns it into a
@@ -250,12 +296,18 @@ class Graph:
     steps: list[Node] = field(default_factory=list)
     version: Optional[int] = None
     default_queue: Optional[str] = None
+    attributes: list[Attribute] = field(default_factory=list)   # values queue criteria can test
 
     def compile(self) -> FlowSpec:
         if not self.name or not self.name.strip():
             raise ValueError("workflow name is required")
         if not self.steps:
             raise ValueError("workflow has no steps")
+        if len(self.attributes) > MAX_ATTRIBUTES:
+            raise ValueError(f"a workflow declares at most {MAX_ATTRIBUTES} attributes, "
+                             f"got {len(self.attributes)}")
+        if len({a.name for a in self.attributes}) != len(self.attributes):
+            raise ValueError("an attribute is declared twice")
 
         graph = _Graph(self.name, self.default_queue or self.name)
         root = _Builder(graph, enclosing_join=None, is_root=True)
@@ -273,6 +325,8 @@ class Graph:
             "queues": queues,
             "executionMode": "SERVER",
         }
+        if self.attributes:
+            definition["attributes"] = [a.to_json() for a in self.attributes]
         version = _check_version(self.version) if self.version is not None else _content_version(definition)
         definition = {"version": version, **definition}
         return FlowSpec(self.name, version, definition, queues)
@@ -341,18 +395,24 @@ class _Graph:
 
     def add_combine(self, name: str, arms: list[str]) -> str:
         """The mandatory merge node after a fork's join: a TASK bound by name like any step, carrying
-        the fork's arm names (a JSON array) on its ``itemsKey`` so the engine can stage each isolated
-        branch's result under its name for the handler, and strip those keys afterward."""
+        the fork's ``armNames`` so the engine can stage each isolated branch's result for the
+        handler, and strip it afterward."""
         nid = self.add_worker("TASK", name, None, None)
-        self.nodes[nid]["itemsKey"] = json.dumps(arms, separators=(",", ":"))
+        self.nodes[nid]["armNames"] = list(arms)
         return nid
 
-    def add_for_each_combine(self, name: str, scratch_key: str) -> str:
-        """The mandatory merge node after a forEach's join: a TASK bound by name whose ``itemsKey``
-        is a JSON STRING (the scratch key the engine stages the collected item results under) —
-        versus a fork combine's arm-name array."""
+    def add_for_each_combine(self, name: str, for_each_name: str) -> str:
+        """The mandatory merge node after a forEach's join: a TASK bound by name whose ``collectKey``
+        is the scratch key the engine stages the collected item results under."""
         nid = self.add_worker("TASK", name, None, None)
-        self.nodes[nid]["itemsKey"] = json.dumps(scratch_key)
+        self.nodes[nid]["collectKey"] = FOR_EACH_SCRATCH_PREFIX + for_each_name
+        return nid
+
+    def add_spawn_combine(self, name: str, step_name: str) -> str:
+        """The combine after a spawning step: a TASK bound by name whose ``collectKey`` stages the
+        results of the branches ``step_name`` created."""
+        nid = self.add_worker("TASK", name, None, None)
+        self.nodes[nid]["collectKey"] = SPAWN_SCRATCH_PREFIX + step_name
         return nid
 
     def add_join(self, expected: int) -> str:
@@ -422,6 +482,10 @@ class _Builder:
             if n.compensate:
                 self.g.nodes[nid]["compensable"] = True
             self.chain(nid)
+            if n.combine:
+                join_id = self.g.add_join(0)                  # 0 = as many as the step creates
+                self.chain(join_id)
+                self.chain(self.g.add_spawn_combine(n.combine, n.name))
         elif isinstance(n, Gate):
             nid = self.g.add_worker("PREDICATE", n.name, n.queue, n.retry)
             self.attach(nid)
@@ -621,6 +685,8 @@ def _content_version(definition: dict) -> int:
         "nodes": canon_nodes,
         "executionMode": definition["executionMode"],
     }
+    if "attributes" in definition:
+        material["attributes"] = definition["attributes"]
     canonical = json.dumps(material, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).digest()
     v = ((digest[0] & 0x7F) << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]

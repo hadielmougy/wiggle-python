@@ -6,10 +6,20 @@ Describe a workflow's topology as declarative data (a Graph of nodes), compile a
 instances from the client, and implement its steps with a worker that binds handlers by name. Talks the
 same gRPC control plane as the Java and Go clients, so their workers interoperate.
 """
-from .client import InstanceView, ScheduleView, WiggleClient
-from .resolver import CellResolver, Placement, is_legacy_id, parse_id
+from .client import (
+    BacklogCoverage,
+    EventBatch,
+    EventView,
+    InstanceView,
+    ReportRefused,
+    ScheduleView,
+    SearchResult,
+    StepStats,
+    WiggleClient,
+)
 from .worker import Compensation, Handlers, PermanentError, Worker
-from . import step  # noqa: F401  (wiggle.step.base() et al.)
+from . import criteria, step  # noqa: F401  (wiggle.step.create() et al., wiggle.criteria)
+from .branch import Branch as CreatedBranch, BranchError, otherwise, when
 from .workflow import (
     AwaitSignal,
     FlowSpec,
@@ -21,6 +31,7 @@ from .workflow import (
     Fork,
     ForEach,
     Gate,
+    Attribute,
     Graph,
     Node,
     Retry,
@@ -49,13 +60,21 @@ __all__ = [
     "WiggleClient",
     "InstanceView",
     "ScheduleView",
+    "EventView",
+    "EventBatch",
+    "SearchResult",
+    "StepStats",
+    "BacklogCoverage",
+    "ReportRefused",
+    "Attribute",
+    "CreatedBranch",
+    "BranchError",
+    "when",
+    "otherwise",
+    "criteria",
     "Worker",
     "Handlers",
     "PermanentError",
-    "CellResolver",
-    "Placement",
-    "parse_id",
-    "is_legacy_id",
 ]
 
 __version__ = "0.1.0"

@@ -1,5 +1,4 @@
-"""Conversions between Python values and the protobuf ``Value`` used on the wire, plus the
-shallow-diff merge the engine expects from a completed step."""
+"""Conversions between Python values and the protobuf ``Value`` used on the wire."""
 from __future__ import annotations
 
 from typing import Any

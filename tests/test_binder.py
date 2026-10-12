@@ -2,9 +2,8 @@
 rule is testable with no server, no worker, no I/O. Mirrors the Java client's HandlerBinderTest."""
 import pytest
 
-from wiggle import step
 from wiggle import _binder
-from wiggle.workflow import Branch, ForEach, Fork, Gate, Graph, Step
+from wiggle.workflow import Branch, Fork, Gate, Graph, Step
 
 
 # ---------------------------------------------------------------- scan
@@ -98,22 +97,15 @@ def _forked():
     ]).compile().definition
 
 
-def test_fork_combine_exposes_step_base_and_returns_verbatim():
+def test_fork_combine_returns_verbatim():
     class H:
         def a1(self, ctx): return ctx
         def b1(self, ctx): return ctx
         def merge(self, ctx) -> dict:
-            # ambient style: the pre-fork base, staged arm keys excluded
-            out = dict(step.base())
-            out.update(ctx["a"])
-            out.update(ctx["b"])
-            return out
+            return {"pre": ctx["pre"], **ctx["a"], **ctx["b"]}
     result = _binder.bind("wf", _binder.scan(H()), _forked())
     merge = next(b.handler for b in result.bindings if b.step == "merge")
-    out = merge({"pre": "P", "a": {"x": 1}, "b": {"y": 2}})
-    assert out == {"pre": "P", "x": 1, "y": 2}
-    with pytest.raises(RuntimeError):
-        step.base()   # the scope is confined to the invocation
+    assert merge({"pre": "P", "a": {"x": 1}, "b": {"y": 2}}) == {"pre": "P", "x": 1, "y": 2}
 
 
 def test_combine_rejects_bool_or_none_annotations():
@@ -125,20 +117,38 @@ def test_combine_rejects_bool_or_none_annotations():
         _binder.bind("wf", _binder.scan(H()), _forked())
 
 
-def test_for_each_combine_base_excludes_the_scratch_key():
-    graph = Graph("wf", [
-        ForEach("per-item", over="items", body=[Step("norm")], combine="collect"),
-    ]).compile().definition
+def test_unstage_presents_fork_arms_by_name():
+    ctx, base, results = _binder.unstage({"n": 1, "__arm__l": {"s": "L"}, "__arm__r": {"s": "R"}},
+                                         ["l", "r"], "", "merge")
+    assert ctx == {"n": 1, "l": {"s": "L"}, "r": {"s": "R"}}
+    assert base == {"n": 1}
+    assert results == {"l": {"s": "L"}, "r": {"s": "R"}}
 
-    class H:
-        def norm(self, item): return item
-        def collect(self, ctx) -> dict:
-            base = step.base()
-            assert "per-item" not in base               # collected results excluded from the base
-            return {**base, "n": len(ctx["per-item"])}
-    result = _binder.bind("wf", _binder.scan(H()), graph)
-    collect = next(b.handler for b in result.bindings if b.step == "collect")
-    assert collect({"items": [1, 2], "per-item": ["a", "b"]}) == {"items": [1, 2], "n": 2}
+
+def test_unstage_presents_for_each_results_by_name():
+    ctx, base, results = _binder.unstage({"items": [1, 2], "__forEach__per-item": ["a", "b"],
+                                          "__steps____forEach__per-item": ["norm", "norm"]},
+                                         [], "__forEach__per-item", "collect")
+    assert ctx == {"items": [1, 2], "per-item": ["a", "b"]}
+    assert base == {"items": [1, 2]}
+    assert results == ["a", "b"]
+
+
+def test_unstage_hands_created_branches_results_over_only_as_results():
+    ctx, base, results = _binder.unstage({"lines": [1], "__spawn__lines": [{"x": 1}],
+                                          "__steps____spawn__lines": ["pick"]},
+                                         [], "__spawn__lines", "packed")
+    assert ctx == base == {"lines": [1]}
+    assert results == [{"x": 1}]
+
+
+def test_unstage_refuses_a_name_the_context_already_has():
+    with pytest.raises(ValueError, match="'payment' is both"):
+        _binder.unstage({"payment": 1, "__arm__payment": {}}, ["payment"], "", "merge")
+
+
+def test_unstage_leaves_other_steps_alone():
+    assert _binder.unstage({"__arm__x": 1}, [], "", "s") == ({"__arm__x": 1}, None, None)
 
 
 # ---------------------------------------------------------------- compensation pairing
