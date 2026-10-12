@@ -2,10 +2,11 @@
 queue it should run -- the JPA criteria shape, evaluated by the server when it claims.
 
     from wiggle import criteria as c
+    from wiggle.criteria import Task_
 
     worker = Worker(client, "eu-1", criteria=[
-        c.QueueCriteria("payments", c.and_(c.equal(c.WORKFLOW, "orders"), c.less_than(c.ATTEMPT, 3))),
-        c.QueueCriteria("shipping", c.equal(c.attr("region"), "eu")),   # a declared attribute
+        c.QueueCriteria("payments", c.and_(c.equal(Task_.WORKFLOW, "orders"), c.less_than(Task_.ATTEMPT, 3))),
+        c.QueueCriteria("shipping", c.equal(Task_.attr("region"), "eu")),   # a declared attribute
     ])
 
 A comparison on an absent value is false (and ``not_`` of it true); only :func:`is_null` and
@@ -39,21 +40,23 @@ class Field:
     attribute: Optional[str] = None
 
 
-WORKFLOW = Field("WORKFLOW", "TEXT")
-VERSION = Field("VERSION", "INTEGER")
-STEP = Field("STEP", "TEXT")                       # equal, not_equal and in_ only
-NODE_ID = Field("NODE_ID", "TEXT")
-KIND = Field("KIND", "TEXT")                       # TASK or PREDICATE
-ATTEMPT = Field("ATTEMPT", "INTEGER")              # 1 on the first run
-CORRELATION_ID = Field("CORRELATION_ID", "TEXT")
-INSTANCE_CREATED_AT = Field("INSTANCE_CREATED_AT", "INTEGER")   # epoch millis, or a datetime
+class Task_:
+    """The task properties a comparison tests, and :meth:`attr` for a value the workflow declares."""
+    WORKFLOW = Field("WORKFLOW", "TEXT")
+    VERSION = Field("VERSION", "INTEGER")
+    STEP = Field("STEP", "TEXT")                       # equal, not_equal and in_ only
+    NODE_ID = Field("NODE_ID", "TEXT")
+    KIND = Field("KIND", "TEXT")                       # TASK or PREDICATE
+    ATTEMPT = Field("ATTEMPT", "INTEGER")              # 1 on the first run
+    CORRELATION_ID = Field("CORRELATION_ID", "TEXT")
+    INSTANCE_CREATED_AT = Field("INSTANCE_CREATED_AT", "INTEGER")   # epoch millis, or a datetime
 
-
-def attr(name: str) -> Field:
-    """A value the workflow declares (``Graph(attributes=[Attribute(name, type, path)])``)."""
-    if not _ATTRIBUTE_NAME.fullmatch(name or ""):
-        raise ValueError(f"attribute '{name}' is not a valid attribute name")
-    return Field("ATTRIBUTE", "ANY", name)
+    @staticmethod
+    def attr(name: str) -> Field:
+        """A value the workflow declares (``Graph(attributes=[Attribute(name, type, path)])``)."""
+        if not _ATTRIBUTE_NAME.fullmatch(name or ""):
+            raise ValueError(f"attribute '{name}' is not a valid attribute name")
+        return Field("ATTRIBUTE", "ANY", name)
 
 
 @dataclass(frozen=True)
@@ -99,7 +102,7 @@ def less_than(field: Field, value: Any) -> Comparison:
     return _cmp(field, "LESS_THAN", value)
 
 
-def less_than_or_equal(field: Field, value: Any) -> Comparison:
+def less_than_or_equal_to(field: Field, value: Any) -> Comparison:
     return _cmp(field, "LESS_THAN_OR_EQUAL", value)
 
 
@@ -107,7 +110,7 @@ def greater_than(field: Field, value: Any) -> Comparison:
     return _cmp(field, "GREATER_THAN", value)
 
 
-def greater_than_or_equal(field: Field, value: Any) -> Comparison:
+def greater_than_or_equal_to(field: Field, value: Any) -> Comparison:
     return _cmp(field, "GREATER_THAN_OR_EQUAL", value)
 
 

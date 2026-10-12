@@ -13,32 +13,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from .workflow import Retry
+from .workflow import RetryPolicy
 
 
 class BranchError(ValueError):
     """A branch was built wrongly. The step fails without a retry: its handler would build it the
     same way again."""
-
-
-class _Arm:
-    """One arm of :meth:`Branch.then_one_of`: ``guard`` (``None`` for the otherwise) and its chain."""
-
-    def __init__(self, guard: Optional[str], chain: Callable[["Branch"], Any]):
-        self.guard = guard
-        self.chain = chain
-
-
-def when(guard: str, chain: Callable[["Branch"], Any]) -> _Arm:
-    """An arm of :meth:`Branch.then_one_of`, run when the gate ``guard`` holds."""
-    if not guard:
-        raise BranchError("when() needs a guard step name")
-    return _Arm(guard, chain)
-
-
-def otherwise(chain: Callable[["Branch"], Any]) -> _Arm:
-    """The last arm of :meth:`Branch.then_one_of`, run when no guard held."""
-    return _Arm(None, chain)
 
 
 class Branch:
@@ -48,19 +28,28 @@ class Branch:
         self.input = input
         self.key = key
         self.steps: list[dict] = []
+        # set on an arm of then_one_of: the guard that opened it, or _OTHERWISE
+        self._choice_arm = False
+        self._guard: Optional[str] = None
 
-    def then_apply(self, name: str, *, queue: Optional[str] = None, retry: Optional[Retry] = None,
-                   compensate: bool = False) -> "Branch":
+    def then_apply(self, name: str, *, queue: Optional[str] = None,
+                   retry: Optional[RetryPolicy] = None) -> "Branch":
         """A task: its handler's return becomes the branch's context."""
-        return self._add(name, "TASK", queue, retry, compensate)
+        return self._add(name, "TASK", queue, retry, False)
 
-    def then_accept(self, name: str, *, queue: Optional[str] = None, retry: Optional[Retry] = None,
-                    compensate: bool = False) -> "Branch":
+    def then_apply_compensable(self, name: str, *, queue: Optional[str] = None,
+                               retry: Optional[RetryPolicy] = None) -> "Branch":
+        """A task with an undo: its compensator (``Worker.handle_compensation``) runs in the reverse
+        pass if the instance later fails."""
+        return self._add(name, "TASK", queue, retry, True)
+
+    def then_accept(self, name: str, *, queue: Optional[str] = None,
+                    retry: Optional[RetryPolicy] = None) -> "Branch":
         """A side effect: the branch's context is left unchanged."""
-        return self._add(name, "TASK", queue, retry, compensate)
+        return self._add(name, "TASK", queue, retry, False)
 
     def then_filter(self, name: str, *, queue: Optional[str] = None,
-                    retry: Optional[Retry] = None) -> "Branch":
+                    retry: Optional[RetryPolicy] = None) -> "Branch":
         """A gate: false ends this branch at the join, as a false gate ends a fork arm."""
         return self._add(name, "PREDICATE", queue, retry, False)
 
@@ -103,14 +92,12 @@ class Branch:
         self.steps.append({"name": node, "kind": "SUB_WORKFLOW", "workflow": workflow})
         return self
 
-    def then_all_of(self, *arms: Callable[["Branch"], Any], combine: str) -> "Branch":
+    def then_all_of(self, *arms: Callable[["Branch"], Any]) -> "_Arms":
         """Runs ``arms`` in parallel, each on its own copy of this branch's context; the combine
-        ``combine`` receives each arm's result under the arm's name -- its last step's, which must
-        be a task or a gate."""
+        named by ``.combine(name)`` receives each arm's result under the arm's name -- its last
+        step's, which must be a task or a gate."""
         if len(arms) < 2:
             raise BranchError("then_all_of needs at least two arms")
-        if not combine:
-            raise BranchError("then_all_of needs a combine step name")
         chains = [_chain(a, f"arm {i}") for i, a in enumerate(arms)]
         names = []
         for i, chain in enumerate(chains):
@@ -121,8 +108,7 @@ class Branch:
                 raise BranchError(f"two arms of then_all_of end in '{last['name']}'; an arm is named "
                                   f"after its last step")
             names.append(last["name"])
-        self.steps.append({"kind": "FORK", "combine": combine, "arms": chains})
-        return self
+        return _Arms(self, chains)
 
     def repeat_while(self, condition: str, body: Callable[["Branch"], Any], *,
                      max_iterations: int = 0) -> "Branch":
@@ -137,24 +123,47 @@ class Branch:
                            "loop_budget": max_iterations})
         return self
 
-    def then_one_of(self, *arms: _Arm) -> "Branch":
-        """Runs the first arm whose guard holds (:func:`when`), or the :func:`otherwise` arm, which
-        must come last. Without one, a choice where no guard held goes on past it."""
-        if not arms or arms[0].guard is None:
-            raise BranchError("then_one_of needs an arm opened with when(...)")
+    def then_one_of(self, *arms: Callable[["Branch"], Any]) -> "Branch":
+        """Runs the first of ``arms`` whose guard holds: each arm opens with :meth:`when` or, last,
+        :meth:`otherwise`. Without an otherwise, a choice where no guard held goes on past it.
+
+            b.then_one_of(lambda a: a.when("bulk").then_apply("pallet"),
+                          lambda a: a.otherwise().then_apply("parcel"))"""
         cases = []
-        for i, arm in enumerate(arms):
-            if not isinstance(arm, _Arm):
-                raise BranchError(f"arm {i} of then_one_of must be when(...) or otherwise(...)")
-            if arm.guard is None and i != len(arms) - 1:
+        for i, build in enumerate(arms):
+            arm = Branch()
+            arm._choice_arm = True
+            build(arm)
+            if arm._guard is None:
+                raise BranchError(f"arm {i} of then_one_of must open with when(...) or otherwise()")
+            if arm._guard is _OTHERWISE and i != len(arms) - 1:
                 raise BranchError("otherwise() must be the last arm of then_one_of")
-            sub = Branch()
-            arm.chain(sub)
-            cases.append((arm.guard, sub.steps))
+            cases.append((None if arm._guard is _OTHERWISE else arm._guard, arm.steps))
+        if not cases or cases[0][0] is None:
+            raise BranchError("then_one_of needs an arm opened with when(...)")
         self.steps.append({"kind": "PREDICATE", "cases": cases})
         return self
 
-    def _add(self, name: str, kind: str, queue: Optional[str], retry: Optional[Retry],
+    def when(self, guard: str) -> "Branch":
+        """Opens an arm of :meth:`then_one_of`: the steps chained after it run when the gate
+        ``guard`` holds."""
+        if not guard:
+            raise BranchError("when() needs a guard step name")
+        self._open_arm("when")
+        self._guard = guard
+        return self
+
+    def otherwise(self) -> "Branch":
+        """Opens the last arm of :meth:`then_one_of`, run when no guard held."""
+        self._open_arm("otherwise")
+        self._guard = _OTHERWISE
+        return self
+
+    def _open_arm(self, what: str) -> None:
+        if not self._choice_arm or self.steps or self._guard is not None:
+            raise BranchError(f"{what}(...) opens an arm of then_one_of, so it comes first in one")
+
+    def _add(self, name: str, kind: str, queue: Optional[str], retry: Optional[RetryPolicy],
              compensate: bool) -> "Branch":
         if not name:
             raise BranchError("a branch step needs a name")
@@ -165,6 +174,25 @@ class Branch:
             step["retry"] = retry.to_json()
         self.steps.append(step)
         return self
+
+
+class _Arms:
+    """The arms of :meth:`Branch.then_all_of`, waiting for the combine they rejoin at."""
+
+    def __init__(self, branch: Branch, chains: list[list[dict]]):
+        self._branch = branch
+        self._chains = chains
+
+    def combine(self, name: str) -> Branch:
+        """The combine step ``name`` receives each arm's result under the arm's name; the branch
+        goes on with its return."""
+        if not name:
+            raise BranchError("then_all_of needs a combine step name")
+        self._branch.steps.append({"kind": "FORK", "combine": name, "arms": self._chains})
+        return self._branch
+
+
+_OTHERWISE = object()
 
 
 def _chain(build: Callable[[Branch], Any], what: str) -> list[dict]:

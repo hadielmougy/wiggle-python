@@ -25,13 +25,13 @@ from .workflow import SPAWN_SCRATCH_PREFIX, Activity, Predicate, SideEffect
 log = logging.getLogger("wiggle.worker")
 
 
-class PermanentError(Exception):
+class PermanentActivityError(Exception):
     """Raise from a handler to fail the step without retrying (a bad request, not a blip)."""
 
 
 class Handlers:
     """Optional base for a class whose methods implement a workflow's steps -- one public method per
-    step, each taking the context. Register an instance with :meth:`Worker.register_handlers`.
+    step, each taking the context. Register an instance with :meth:`Worker.register_handler`.
 
     Method names match step names **regardless of case style**: ``in_stock``, ``inStock``, and a graph
     step named ``in-stock`` all normalise the same. The method's return annotation picks the kind:
@@ -39,10 +39,27 @@ class Handlers:
     task. Prefix helper methods with ``_`` so they are not treated as step handlers.
 
     Set the class attribute ``workflow`` to the workflow name these handlers implement, or pass
-    ``workflow=`` to :meth:`Worker.register_handlers`.
+    ``workflow=`` to :meth:`Worker.register_handler`.
     """
 
     workflow: Optional[str] = None
+
+
+def for_flow(workflow: str) -> Callable[[type], type]:
+    """Marks a class as the handler set for ``workflow``, as Java's ``@ForFlow`` does -- the same as
+    setting its ``workflow`` attribute:
+
+        @for_flow("orders")
+        class OrderHandlers:
+            def validate(self, ctx): ...
+    """
+    if not workflow:
+        raise ValueError("for_flow needs a workflow name")
+
+    def mark(cls: type) -> type:
+        cls.workflow = workflow
+        return cls
+    return mark
 
 
 _canonical = _binder.canonical   # re-exported: step-name folding lives in wiggle._binder
@@ -53,7 +70,7 @@ class Worker:
     registered separately (``client.register`` of a compiled :class:`Graph`, or the ``wiggle`` CLI).
 
     >>> worker = Worker(client, "worker-1").handle("order", "validate", validate)
-    >>> worker.start()          # background threads; call stop() to drain
+    >>> worker.start()          # background threads; call close() to drain
     """
 
     def __init__(self, client: WiggleClient, worker_id: str, *,
@@ -146,7 +163,7 @@ class Worker:
         """Declare steps of ``workflow`` that only branches created at run time run
         (``wiggle.step.create(...).then_apply(step)``), so they are in no registered graph. Their
         handlers -- bound with :meth:`handle` and its siblings, or methods of a
-        :meth:`register_handlers` object -- are then not matched against the graph on
+        :meth:`register_handler` object -- are then not matched against the graph on
         :meth:`start`, but bound when such a step is first dispatched. A branch step on a queue
         no graph mentions runs only on a worker that polls that queue (``queues=``/``criteria=``)."""
         if not workflow or not steps:
@@ -154,7 +171,7 @@ class Worker:
         self._branch_steps.setdefault(workflow, set()).update(_binder.canonical(s) for s in steps)
         return self
 
-    def register_handlers(self, handlers: object, *, workflow: Optional[str] = None) -> "Worker":
+    def register_handler(self, handlers: object, *, workflow: Optional[str] = None) -> "Worker":
         """Bind a whole object's methods as step handlers in one call. Each public method that takes a
         context becomes a handler; on :meth:`start` the worker matches it to a step of ``workflow`` by
         **case-insensitive name** (``in_stock``/``inStock`` both match a step named ``in-stock``) and
@@ -168,7 +185,7 @@ class Worker:
         """
         wf = workflow or getattr(handlers, "workflow", None)
         if not wf:
-            raise ValueError("register_handlers needs a workflow name: pass workflow=... or set a "
+            raise ValueError("register_handler needs a workflow name: pass workflow=... or set a "
                              "'workflow' attribute on the handlers object")
         candidates = _binder.scan(handlers)   # validates case-fold duplicates
         self._handler_sets.append((wf, candidates))
@@ -208,7 +225,7 @@ class Worker:
                  self.worker_id, sorted(self._served_queues), self._concurrency)
         return self
 
-    def stop(self, timeout_s: float = 10.0) -> None:
+    def close(self, timeout_s: float = 10.0) -> None:
         self._running.clear()
         if self._executor:
             self._executor.shutdown(wait=True, cancel_futures=False)
@@ -219,7 +236,7 @@ class Worker:
         return self.start()
 
     def __exit__(self, *exc) -> None:
-        self.stop()
+        self.close()
 
     def run_forever(self) -> None:
         """Start and block until interrupted (Ctrl-C)."""
@@ -230,7 +247,7 @@ class Worker:
         except KeyboardInterrupt:
             pass
         finally:
-            self.stop()
+            self.close()
 
     # ---- internals ----
 
@@ -297,7 +314,7 @@ class Worker:
             self._match_handler_set(wf, candidates)
 
     def _match_handler_set(self, wf: str, candidates: dict[str, "_binder.Candidate"]) -> None:
-        """Match a :meth:`register_handlers` object's methods to ``wf``'s steps (fetched here — the
+        """Match a :meth:`register_handler` object's methods to ``wf``'s steps (fetched here — the
         binder itself is pure) and install the resulting bindings. See :mod:`wiggle._binder`."""
         graph = self._fetch_graph(wf)
         result = _binder.bind(wf, candidates, graph, frozenset(self._branch_steps.get(wf, ())))
@@ -423,7 +440,7 @@ class Worker:
                 self._client.report_steps(task.task_id, task.lease_owner, [report])
             except ReportRefused as e:   # the lease was lost; the task re-runs elsewhere
                 log.warning("%s", e)
-        except (PermanentError, BranchError) as e:
+        except (PermanentActivityError, BranchError) as e:
             self._client.fail(task.task_id, task.lease_owner, str(e), retryable=False)
         except Exception as e:  # noqa: BLE001 - a handler failure is a step failure, retried
             log.debug("step %s of %s failed: %s", task.step_name, task.instance_id, e)
@@ -434,7 +451,7 @@ class Worker:
     def _handler_for(self, task) -> Optional[Callable]:
         """The handler for ``task``. A step on a created node (id ``~...``) is in no graph, so it
         binds by name on first dispatch -- from a :meth:`handle` binding of a declared branch step,
-        or a method of a :meth:`register_handlers` object -- and so does its undo, which may run on
+        or a method of a :meth:`register_handler` object -- and so does its undo, which may run on
         a worker that never ran the step."""
         handler = self._handlers.get(task.activity)
         if not task.node_id.startswith("~"):

@@ -1,6 +1,6 @@
 """Wiggle — Python client and worker for the Wiggle workflow engine.
 
-    from wiggle import Graph, Step, Gate, Effect, Retry, WiggleClient, Worker
+    from wiggle import Graph, Step, Gate, Effect, RetryPolicy, WiggleClient, Worker
 
 Describe a workflow's topology as declarative data (a Graph of nodes), compile and register it, start
 instances from the client, and implement its steps with a worker that binds handlers by name. Talks the
@@ -17,10 +17,11 @@ from .client import (
     StepStats,
     WiggleClient,
 )
-from .worker import Compensation, Handlers, PermanentError, Worker
+from .worker import Compensation, Handlers, PermanentActivityError, Worker, for_flow
 from . import criteria, step  # noqa: F401  (wiggle.step.create() et al., wiggle.criteria)
-from .branch import Branch as CreatedBranch, BranchError, otherwise, when
+from .branch import Branch as CreatedBranch, BranchError
 from .workflow import (
+    AttrType,
     AwaitSignal,
     FlowSpec,
     Branch,
@@ -34,7 +35,7 @@ from .workflow import (
     Attribute,
     Graph,
     Node,
-    Retry,
+    RetryPolicy,
     Sleep,
     Step,
     SubWorkflow,
@@ -55,7 +56,7 @@ __all__ = [
     "Choose",
     "Case",
     "DoWhile",
-    "Retry",
+    "RetryPolicy",
     "FlowSpec",
     "WiggleClient",
     "InstanceView",
@@ -67,14 +68,14 @@ __all__ = [
     "BacklogCoverage",
     "ReportRefused",
     "Attribute",
+    "AttrType",
     "CreatedBranch",
     "BranchError",
-    "when",
-    "otherwise",
     "criteria",
     "Worker",
     "Handlers",
-    "PermanentError",
+    "for_flow",
+    "PermanentActivityError",
 ]
 
 __version__ = "0.1.0"

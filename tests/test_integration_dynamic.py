@@ -5,8 +5,7 @@ import time
 
 import pytest
 
-from wiggle import (Attribute, Graph, Step, WiggleClient, Worker, criteria as c, otherwise, step,
-                    when)
+from wiggle import (AttrType, Attribute, Graph, Step, WiggleClient, Worker, criteria as c, step)
 
 URL = os.environ.get("WIGGLE_TEST_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="set WIGGLE_TEST_URL to run integration tests")
@@ -81,7 +80,7 @@ class FanHandlers:
 def test_keyed_branches_reach_the_combine_as_a_dict(client):
     name = _name("py-dyn-keyed")
     flow = Graph(name, [Step("fan", combine="gather")]).compile()
-    w = _worker(client, "dyn-keyed").register_handlers(FanHandlers(), workflow=name)
+    w = _worker(client, "dyn-keyed").register_handler(FanHandlers(), workflow=name)
     v = _run(client, flow, w, {"xs": {"a": 1, "b": 2}})
     assert v.status == "COMPLETED", v.error
     assert v.context == {"doubled": {"a": 2, "b": 4}}
@@ -132,9 +131,9 @@ def test_server_side_operators_in_a_branch(client):
         (step.create({"n": 0, "size": 5})
          .then_sleep(millis=50)
          .repeat_while("more", lambda b: b.then_apply("inc"), max_iterations=10)
-         .then_one_of(when("big", lambda b: b.then_apply("label-big")),
-                      otherwise(lambda b: b.then_apply("label-small")))
-         .then_all_of(lambda a: a.then_apply("left"), lambda b: b.then_apply("right"), combine="both")
+         .then_one_of(lambda b: b.when("big").then_apply("label-big"),
+                      lambda b: b.otherwise().then_apply("label-small"))
+         .then_all_of(lambda a: a.then_apply("left"), lambda b: b.then_apply("right")).combine("both")
          .then_sub_flow("child", child)
          .then_await("go")
          .then_filter("keep"))
@@ -208,12 +207,12 @@ def test_a_compensable_branch_step_is_undone_when_the_instance_fails(client):
     undone = []
 
     def boom(ctx):
-        from wiggle import PermanentError
-        raise PermanentError("downstream exploded")
+        from wiggle import PermanentActivityError
+        raise PermanentActivityError("downstream exploded")
 
     w = (_worker(client, "dyn-saga")
          .branch_steps(name, "hold")
-         .handle(name, "book", lambda ctx: (step.create({"seat": 7}).then_apply("hold", compensate=True), ctx)[1])
+         .handle(name, "book", lambda ctx: (step.create({"seat": 7}).then_apply_compensable("hold"), ctx)[1])
          .handle(name, "hold", lambda b: {**b, "held": True})
          .handle_compensation(name, "hold", undone.append)
          .handle_combine(name, "settle", lambda ctx: ctx)
@@ -237,12 +236,12 @@ def test_queue_criteria_claim_only_the_matching_tasks(client):
     name = _name("py-crit")
     queue = name + "-q"
     flow = Graph(name, [Step("work", queue=queue)],
-                 attributes=[Attribute("tier", "STRING", "customer.tier")]).compile()
+                 attributes=[Attribute("tier", AttrType.STRING, "customer.tier")]).compile()
     client.register(flow)
     done = []
-    gold_only = c.QueueCriteria(queue, c.and_(c.equal(c.WORKFLOW, name),
-                                              c.equal(c.attr("tier"), "gold"),
-                                              c.less_than(c.ATTEMPT, 5)))
+    gold_only = c.QueueCriteria(queue, c.and_(c.equal(c.Task_.WORKFLOW, name),
+                                              c.equal(c.Task_.attr("tier"), "gold"),
+                                              c.less_than(c.Task_.ATTEMPT, 5)))
     w = _worker(client, "crit-gold", criteria=[gold_only]).handle(
         name, "work", lambda ctx: (done.append(ctx["customer"]["tier"]), {**ctx, "done": True})[1])
     with w.start():
@@ -254,7 +253,7 @@ def test_queue_criteria_claim_only_the_matching_tasks(client):
         slices = [s for s in client.backlog_coverage().slices if s.workflow == name]
         assert slices and slices[0].ready_count == 1 and slices[0].coverage != "COVERED"
     other = _worker(client, "crit-silver", criteria=[
-        c.QueueCriteria(queue, c.in_(c.CORRELATION_ID, "s", "t"))]).handle(name, "work", lambda ctx: ctx)
+        c.QueueCriteria(queue, c.in_(c.Task_.CORRELATION_ID, "s", "t"))]).handle(name, "work", lambda ctx: ctx)
     with other.start():
         assert client.await_completion(silver, timeout_s=20).status == "COMPLETED"
     assert done == ["gold"]

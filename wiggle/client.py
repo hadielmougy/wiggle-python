@@ -277,18 +277,18 @@ class WiggleClient:
 
     # ---- schedules ----
 
-    def create_schedule(self, workflow: str, *, every_s: Optional[float] = None,
-                        cron: Optional[str] = None, context: Any = None) -> ScheduleView:
-        if (every_s is None) == (cron is None):
-            raise ValueError("pass exactly one of every_s or cron")
-        req = pb.CreateScheduleRequest(workflow=workflow, context=to_value(context))
-        if every_s is not None:
-            req.every_millis = int(every_s * 1000)
-        else:
-            req.cron = cron
+    def create_schedule(self, workflow: str, every_s: float, context: Any = None) -> ScheduleView:
+        """Start ``workflow`` every ``every_s`` seconds."""
+        req = pb.CreateScheduleRequest(workflow=workflow, context=to_value(context),
+                                       every_millis=int(every_s * 1000))
         return _schedule(self._stub.CreateSchedule(req))
 
-    def list_schedules(self) -> list[ScheduleView]:
+    def create_cron_schedule(self, workflow: str, cron: str, context: Any = None) -> ScheduleView:
+        """Start ``workflow`` on the ``cron`` expression."""
+        req = pb.CreateScheduleRequest(workflow=workflow, context=to_value(context), cron=cron)
+        return _schedule(self._stub.CreateSchedule(req))
+
+    def schedules(self) -> list[ScheduleView]:
         return [_schedule(s) for s in self._stub.ListSchedules(pb.Empty()).schedules]
 
     def delete_schedule(self, schedule_id: str) -> None:

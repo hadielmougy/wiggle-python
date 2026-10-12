@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from wiggle import (AwaitSignal, Branch, Case, Choose, DoWhile, ForEach, Fork, Graph, PermanentError,
+from wiggle import (AwaitSignal, Branch, Case, Choose, DoWhile, ForEach, Fork, Graph, PermanentActivityError,
                     Sleep, Step, SubWorkflow, WiggleClient, Worker, step)
 
 URL = os.environ.get("WIGGLE_TEST_URL")
@@ -63,7 +63,7 @@ def test_fork_combine(client):
 
 def test_for_each(client):
     name = _name("py-it-each")
-    flow = Graph(name, [ForEach("doubled", over="xs", body=[Step("double")], combine="total")]).compile()
+    flow = Graph(name, [ForEach("doubled", items_key="xs", body=[Step("double")], combine="total")]).compile()
     w = (Worker(client, "it-each", concurrency=2, long_poll_wait_s=1)
          .handle(name, "double", lambda x: x * step.base()["factor"])
          .handle_combine(name, "total", lambda c: {"total": sum(c["doubled"])}))
@@ -131,7 +131,7 @@ def test_compensation(client):
     undone = []
 
     def boom(c):
-        raise PermanentError("downstream exploded")
+        raise PermanentActivityError("downstream exploded")
 
     w = (Worker(client, "it-saga", concurrency=2, long_poll_wait_s=1)
          .handle(name, "reserve", lambda c: {"orderId": c["orderId"], "reservationRef": "r-1"})

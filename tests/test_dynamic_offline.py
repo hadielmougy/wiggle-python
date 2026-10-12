@@ -4,12 +4,12 @@ from decimal import Decimal
 
 import pytest
 
-from wiggle import Attribute, Graph, Step, criteria as c, otherwise, step, when
+from wiggle import Attribute, Graph, Step, criteria as c, step
 from wiggle import _binder
 from wiggle import step as _step_mod
 from wiggle.branch import Branch, BranchError
 from wiggle.client import _branch_step, _criteria
-from wiggle.workflow import Retry
+from wiggle.workflow import RetryPolicy
 
 
 def test_a_step_with_a_combine_compiles_to_a_dynamic_join_and_a_spawn_combine():
@@ -40,15 +40,15 @@ def test_declared_attributes_ride_the_definition_and_change_the_version():
 
 def test_branch_builder_wire_form():
     b = (Branch({"x": 1}, "k")
-         .then_apply("reserve", queue="stock", retry=Retry.none(), compensate=True)
+         .then_apply_compensable("reserve", queue="stock", retry=RetryPolicy.none())
          .combine("packed")
          .then_filter("ok")
          .then_sleep(millis=5)
          .then_await("go", timeout_s=2, escalation=lambda e: e.then_apply("escalate"))
          .then_sub_flow("ship", "shipping")
-         .then_all_of(lambda a: a.then_apply("pay"), lambda a: a.then_filter("check"), combine="settle")
+         .then_all_of(lambda a: a.then_apply("pay"), lambda a: a.then_filter("check")).combine("settle")
          .repeat_while("more", lambda body: body.then_apply("inc"), max_iterations=4)
-         .then_one_of(when("bulk", lambda a: a.then_apply("b")), otherwise(lambda a: None)))
+         .then_one_of(lambda a: a.when("bulk").then_apply("b"), lambda a: a.otherwise()))
     wire = [_branch_step(s) for s in b.steps]
     assert [w.kind for w in wire] == ["TASK", "PREDICATE", "SLEEP", "SIGNAL", "SUB_WORKFLOW", "FORK",
                                       "PREDICATE", "PREDICATE"]
@@ -66,11 +66,11 @@ def test_branch_builder_wire_form():
 @pytest.mark.parametrize("build", [
     lambda b: b.combine("x"),                                                   # nothing to make spawn
     lambda b: b.then_filter("g").combine("x"),                                  # a gate cannot spawn
-    lambda b: b.then_all_of(lambda a: a.then_apply("a"), combine="x"),          # one arm
-    lambda b: b.then_all_of(lambda a: a.then_apply("a"), lambda a: a.then_apply("a"), combine="x"),
-    lambda b: b.then_all_of(lambda a: a.then_apply("a"), lambda a: a.then_sleep(1), combine="x"),
-    lambda b: b.then_one_of(otherwise(lambda a: a.then_apply("a"))),
-    lambda b: b.then_one_of(when("g", lambda a: None), otherwise(lambda a: None), when("h", lambda a: None)),
+    lambda b: b.then_all_of(lambda a: a.then_apply("a")).combine("x"),          # one arm
+    lambda b: b.then_all_of(lambda a: a.then_apply("a"), lambda a: a.then_apply("a")).combine("x"),
+    lambda b: b.then_all_of(lambda a: a.then_apply("a"), lambda a: a.then_sleep(1)).combine("x"),
+    lambda b: b.then_one_of(lambda a: a.otherwise().then_apply("a")),
+    lambda b: b.then_one_of(lambda a: a.when("g"), lambda a: a.otherwise(), lambda a: a.when("h")),
     lambda b: b.repeat_while("more", lambda body: None),
     lambda b: b.then_await("go", escalation=lambda e: e.then_apply("x")),
     lambda b: b.then_sleep(-1),
@@ -119,10 +119,10 @@ def test_branch_steps_are_left_out_of_graph_matching_and_bound_on_dispatch():
 
 
 def test_criteria_encode_to_the_wire():
-    q = c.QueueCriteria("pay", c.and_(c.equal(c.WORKFLOW, "orders"), c.not_(c.in_(c.ATTEMPT, 3, 4)),
-                                      c.or_(c.between(c.attr("amount"), Decimal("1.50"), 10.25),
-                                            c.equal(c.attr("vip"), True)),
-                                      c.is_null(c.CORRELATION_ID)))
+    q = c.QueueCriteria("pay", c.and_(c.equal(c.Task_.WORKFLOW, "orders"), c.not_(c.in_(c.Task_.ATTEMPT, 3, 4)),
+                                      c.or_(c.between(c.Task_.attr("amount"), Decimal("1.50"), 10.25),
+                                            c.equal(c.Task_.attr("vip"), True)),
+                                      c.is_null(c.Task_.CORRELATION_ID)))
     w = _criteria(q)
     terms = w.where.all_of.terms
     assert (terms[0].cmp.field, terms[0].cmp.op, terms[0].cmp.args[0].text) == ("WORKFLOW", "EQUAL", "orders")
@@ -134,20 +134,27 @@ def test_criteria_encode_to_the_wire():
 
 
 @pytest.mark.parametrize("build", [
-    lambda: c.equal(c.WORKFLOW, 3),                       # text field, integer literal
-    lambda: c.less_than(c.ATTEMPT, "3"),                  # integer field, text literal
-    lambda: c.like(c.ATTEMPT, "1%"),                      # like on an integer field
-    lambda: c.less_than(c.STEP, "a"),                     # STEP: equality only
-    lambda: c.between(c.VERSION, 1),                      # arity
-    lambda: c.in_(c.attr("x"), "a", 1),                   # mixed attribute types
-    lambda: c.less_than(c.attr("flag"), True),            # ordering a boolean
-    lambda: c.equal(c.attr("x"), Decimal("1.12345678901")),   # past the decimal scale
-    lambda: c.equal(c.WORKFLOW, "x" * 300),               # text too long
-    lambda: c.attr("Bad"),
+    lambda: c.equal(c.Task_.WORKFLOW, 3),                       # text field, integer literal
+    lambda: c.less_than(c.Task_.ATTEMPT, "3"),                  # integer field, text literal
+    lambda: c.like(c.Task_.ATTEMPT, "1%"),                      # like on an integer field
+    lambda: c.less_than(c.Task_.STEP, "a"),                     # STEP: equality only
+    lambda: c.between(c.Task_.VERSION, 1),                      # arity
+    lambda: c.in_(c.Task_.attr("x"), "a", 1),                   # mixed attribute types
+    lambda: c.less_than(c.Task_.attr("flag"), True),            # ordering a boolean
+    lambda: c.equal(c.Task_.attr("x"), Decimal("1.12345678901")),   # past the decimal scale
+    lambda: c.equal(c.Task_.WORKFLOW, "x" * 300),               # text too long
+    lambda: c.Task_.attr("Bad"),
     lambda: c.QueueCriteria(""),
     lambda: c.QueueCriteria("q", c.not_(c.not_(c.not_(c.not_(c.not_(c.not_(c.not_(c.not_(
-        c.is_null(c.STEP)))))))))),                      # deeper than 8
+        c.is_null(c.Task_.STEP)))))))))),                      # deeper than 8
 ])
 def test_criteria_refuse_what_the_server_would(build):
     with pytest.raises((ValueError, TypeError)):
         build()
+
+
+def test_when_and_otherwise_open_an_arm_of_then_one_of_only():
+    with pytest.raises(BranchError, match="opens an arm"):
+        Branch().when("g")
+    with pytest.raises(BranchError, match="opens an arm"):
+        Branch().then_one_of(lambda a: a.then_apply("x").when("g"))

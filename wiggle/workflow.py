@@ -10,13 +10,13 @@ The context is a plain ``dict`` that flows through the steps. A handler returns 
 (usually ``{**ctx, ...}``); the engine merges only what changed, so parallel branches that touch
 different fields merge cleanly.
 
-    from wiggle import Graph, Step, Gate, Effect, Fork, Branch, Retry
+    from wiggle import Graph, Step, Gate, Effect, Fork, Branch, RetryPolicy
 
     wf = Graph("order", [
         Step("validate"),
         Gate("in-stock"),
         Fork([
-            Branch("payment",  [Step("charge", queue="payments", retry=Retry.exponential(5, 0.1))]),
+            Branch("payment",  [Step("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1))]),
             Branch("shipping", [Step("reserve"), Step("label")]),
         ]),
         Effect("notify"),
@@ -49,7 +49,7 @@ Predicate = Callable[[Context], bool]        # gate / choose guard / do-while co
 
 
 @dataclass(frozen=True)
-class Retry:
+class RetryPolicy:
     """A per-step retry policy. Backoffs are given in seconds."""
 
     max_attempts: int = _MAX_INT
@@ -68,20 +68,20 @@ class Retry:
         }
 
     @staticmethod
-    def forever() -> "Retry":
-        return Retry(_MAX_INT, 1.0, 1.0, 60.0, 0.0)
+    def forever() -> "RetryPolicy":
+        return RetryPolicy(_MAX_INT, 1.0, 1.0, 60.0, 0.0)
 
     @staticmethod
-    def none() -> "Retry":
-        return Retry(1, 0.0, 1.0, 0.0, 0.0)
+    def none() -> "RetryPolicy":
+        return RetryPolicy(1, 0.0, 1.0, 0.0, 0.0)
 
     @staticmethod
-    def exponential(max_attempts: int, initial_backoff_s: float) -> "Retry":
-        return Retry(max_attempts, initial_backoff_s, 2.0, 300.0, 0.2)
+    def exponential(max_attempts: int, initial_backoff_s: float) -> "RetryPolicy":
+        return RetryPolicy(max_attempts, initial_backoff_s, 2.0, 300.0, 0.2)
 
     @staticmethod
-    def fixed(max_attempts: int, backoff_s: float) -> "Retry":
-        return Retry(max_attempts, backoff_s, 1.0, backoff_s, 0.0)
+    def fixed(max_attempts: int, backoff_s: float) -> "RetryPolicy":
+        return RetryPolicy(max_attempts, backoff_s, 1.0, backoff_s, 0.0)
 
 
 # ---- the declarative node types (mirror the graph schema) ----
@@ -108,7 +108,7 @@ class Step(Node):
 
     name: str
     queue: Optional[str] = None      # None -> the default queue
-    retry: Optional[Retry] = None    # None -> default (retry forever)
+    retry: Optional[RetryPolicy] = None    # None -> default (retry forever)
     compensate: bool = False         # declare an undo; a compensator MUST be bound for this step
     combine: str = ""                # a spawning step: the combine its created branches rejoin at
 
@@ -122,7 +122,7 @@ class Effect(Node):
 
     name: str
     queue: Optional[str] = None
-    retry: Optional[Retry] = None
+    retry: Optional[RetryPolicy] = None
     compensate: bool = False
     combine: str = ""
 
@@ -135,7 +135,7 @@ class Gate(Node):
 
     name: str
     queue: Optional[str] = None
-    retry: Optional[Retry] = None
+    retry: Optional[RetryPolicy] = None
 
 
 @dataclass
@@ -193,7 +193,7 @@ class Fork(Node):
 
 @dataclass
 class ForEach(Node):
-    """Runtime fan-out: at run time the engine reads the collection in the context at ``over`` (a
+    """Runtime fan-out: at run time the engine reads the collection in the context at ``items_key`` (a
     list or a map) and spawns one parallel branch per element, each on its own ISOLATED copy of the
     context with the element injected under ``as_`` (its index under ``as_ + "Index"`` and, for a
     map, its key under ``as_ + "Key"``). Item writes never touch the shared context. ``combine``
@@ -203,7 +203,7 @@ class ForEach(Node):
     replaces the context with it). An empty collection skips the body and the combine."""
 
     name: str
-    over: str                # itemsKey: the context key holding the collection
+    items_key: str           # the context key holding the collection
     body: list["Node"]
     combine: str = ""
 
@@ -227,7 +227,7 @@ class Choose(Node):
 
 @dataclass
 class DoWhile(Node):
-    """A do-while loop: run ``body`` once, then evaluate the ``while_`` predicate on a worker; while it
+    """A do-while loop: run ``body`` once, then evaluate the ``condition`` predicate on a worker; while it
     holds, the body runs again (the body always runs at least once).
 
     Every loop is budgeted: the guard may evaluate true at most ``max_iterations`` times, after
@@ -236,7 +236,7 @@ class DoWhile(Node):
     (``WIGGLE_LOOP_MAX_ITERATIONS``, 10,000); set it explicitly when a loop legitimately needs
     more."""
 
-    while_: str
+    condition: str
     body: list["Node"]
     max_iterations: int = 0
 
@@ -253,16 +253,26 @@ class FlowSpec:
 
 
 _ATTRIBUTE_NAME = re.compile(r"[a-z][a-z0-9_]{0,62}")
-_ATTRIBUTE_TYPES = ("STRING", "LONG", "DECIMAL", "BOOLEAN")
 MAX_ATTRIBUTES = 16
+
+
+class AttrType:
+    """The type of a declared :class:`Attribute`, and how a context value is read as one."""
+    STRING = "STRING"
+    LONG = "LONG"
+    DECIMAL = "DECIMAL"
+    BOOLEAN = "BOOLEAN"
+
+
+_ATTRIBUTE_TYPES = (AttrType.STRING, AttrType.LONG, AttrType.DECIMAL, AttrType.BOOLEAN)
 
 
 @dataclass(frozen=True)
 class Attribute:
-    """A value the workflow declares for queue criteria to test (``wiggle.criteria.attr(name)``):
-    ``path`` is a dotted path into the context a step receives, read as ``type`` -- ``STRING``,
-    ``LONG``, ``DECIMAL`` or ``BOOLEAN``. The server extracts it each time a step becomes ready; a
-    value that is missing or does not fit the type is absent."""
+    """A value the workflow declares for queue criteria to test (``Task_.attr(name)``): ``path`` is
+    a dotted path into the context a step receives, read as ``type`` -- an :class:`AttrType`. The
+    server extracts it each time a step becomes ready; a value that is missing or does not fit the
+    type is absent."""
 
     name: str
     type: str
@@ -355,13 +365,13 @@ class _Graph:
             raise ValueError(f"duplicate step name '{name}'")
         self.reserved.add(name)
 
-    def add_worker(self, kind: str, name: str, queue: Optional[str], retry: Optional[Retry]) -> str:
+    def add_worker(self, kind: str, name: str, queue: Optional[str], retry: Optional[RetryPolicy]) -> str:
         self._reserve(name)
         nid = self._nid()
         q = queue or self.default_queue
         self.queues.add(q)
         self.nodes[nid] = {"id": nid, "kind": kind, "name": name, "activity": f"{self.name}#{name}",
-                           "queue": q, "retry": (retry or Retry.forever()).to_json()}
+                           "queue": q, "retry": (retry or RetryPolicy.forever()).to_json()}
         return nid
 
     def add_timer(self, kind: str, name: str, millis: int, reserve: bool) -> str:
@@ -545,7 +555,7 @@ class _Builder:
         if not n.combine:
             raise ValueError("for_each needs a combine step name (ForEach(..., combine=...)): item "
                              "results rejoin at an explicit merge handler; there is no implicit fold")
-        fork_id = self.g.add_dynfork(n.name, n.over, n.over)
+        fork_id = self.g.add_dynfork(n.name, n.items_key, n.items_key)
         self.attach(fork_id)
         join_id = self.g.add_join(0)                          # 0 = dynamic width
         template_start = self._build_branch(Branch(n.name, n.body), join_id)
@@ -561,8 +571,8 @@ class _Builder:
         if sub.start is None:
             raise ValueError("do_while body defines no steps")
         if n.max_iterations < 0:
-            raise ValueError(f"do_while '{n.while_}': max_iterations must be positive (0 = engine default)")
-        cond_id = self.g.add_worker("PREDICATE", n.while_, None, None)
+            raise ValueError(f"do_while '{n.condition}': max_iterations must be positive (0 = engine default)")
+        cond_id = self.g.add_worker("PREDICATE", n.condition, None, None)
         # -1 = the engine-default budget sentinel, mirroring the Java client's two-arg doWhile.
         self.g.nodes[cond_id]["loopBudget"] = n.max_iterations if n.max_iterations > 0 else -1
         self.attach(sub.start)                                # enter at the body
