@@ -53,7 +53,7 @@ class Task_:
 
     @staticmethod
     def attr(name: str) -> Field:
-        """A value the workflow declares (``Graph(attributes=[Attribute(name, type, path)])``)."""
+        """A value the workflow declares (``f.attribute(name, type, path)`` in its definition)."""
         if not _ATTRIBUTE_NAME.fullmatch(name or ""):
             raise ValueError(f"attribute '{name}' is not a valid attribute name")
         return Field("ATTRIBUTE", "ANY", name)

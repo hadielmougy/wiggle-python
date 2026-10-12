@@ -159,7 +159,7 @@ def bind(workflow: str, candidates: dict[str, Candidate], graph: dict,
         step_name, node = by_canon[target]
         if node["kind"] != "TASK" or is_combine(node) or not node.get("compensable"):
             raise ValueError(f"compensator '{cand.name}' targets step '{step_name}' of workflow "
-                             f"'{workflow}', which is not declared compensate=True in the topology")
+                             f"'{workflow}', which is not declared compensable in the topology")
         bindings.append(Binding(f"{workflow}#{step_name}#compensate", step_name,
                                 node.get("queue", workflow), _compensation_wrapper(cand.method)))
     for canon in forward:
@@ -169,7 +169,7 @@ def bind(workflow: str, candidates: dict[str, Candidate], graph: dict,
         step_name, node = match
         if node["kind"] == "TASK" and node.get("compensable") and canon not in compensators:
             raise ValueError(f"step '{step_name}' of workflow '{workflow}' is declared "
-                             f"compensate=True but the handlers object has no "
+                             f"compensable but the handlers object has no "
                              f"'compensate_{canon}' method taking a wiggle.Compensation")
     unserved = sorted(set(nodes) - served)
     return Result(bindings, unserved)

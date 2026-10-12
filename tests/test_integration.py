@@ -8,8 +8,7 @@ import time
 
 import pytest
 
-from wiggle import (AwaitSignal, Branch, Case, Choose, DoWhile, ForEach, Fork, Graph, PermanentActivityError,
-                    Sleep, Step, SubWorkflow, WiggleClient, Worker, step)
+from wiggle import FlowSpec, PermanentActivityError, Wiggle, WiggleClient, Worker, step
 
 URL = os.environ.get("WIGGLE_TEST_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="set WIGGLE_TEST_URL to run integration tests")
@@ -34,7 +33,7 @@ def _run(client, flow, worker, context, timeout_s=30.0):
 
 def test_linear_flow_with_gate(client):
     name = _name("py-it-order")
-    flow = Graph(name, [Step("validate"), Step("charge", queue=name + "-payments")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("validate").then_apply("charge", queue=name + "-payments"))
     w = (Worker(client, "it-order", concurrency=2, long_poll_wait_s=1)
          .handle(name, "validate", lambda c: {**c, "status": "VALIDATED"})
          .handle(name, "charge", lambda c: {**c, "paymentRef": f"auth-{c['orderId']}"}))
@@ -45,12 +44,11 @@ def test_linear_flow_with_gate(client):
 
 def test_fork_combine(client):
     name = _name("py-it-fork")
-    flow = Graph(name, [Fork([Branch("left", [Step("l")]), Branch("right", [Step("r")])],
-                             combine="join")]).compile()
+    flow = FlowSpec.define(name, lambda f: Wiggle.all_of(f.then_apply("l"), f.then_apply("r")).combine("join"))
 
     def join(c):
         assert step.base() == {"n": 1}
-        return {"n": c["n"], "sides": c["left"]["side"] + c["right"]["side"]}
+        return {"n": c["n"], "sides": c["l"]["side"] + c["r"]["side"]}
 
     w = (Worker(client, "it-fork", concurrency=2, long_poll_wait_s=1)
          .handle(name, "l", lambda c: {**c, "side": "L"})
@@ -63,7 +61,8 @@ def test_fork_combine(client):
 
 def test_for_each(client):
     name = _name("py-it-each")
-    flow = Graph(name, [ForEach("doubled", items_key="xs", body=[Step("double")], combine="total")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_for_each("xs", lambda i: i.then_apply("double"), name="doubled")
+                           .combine("total"))
     w = (Worker(client, "it-each", concurrency=2, long_poll_wait_s=1)
          .handle(name, "double", lambda x: x * step.base()["factor"])
          .handle_combine(name, "total", lambda c: {"total": sum(c["doubled"])}))
@@ -74,10 +73,11 @@ def test_for_each(client):
 
 def test_choose_and_do_while(client):
     name = _name("py-it-loop")
-    flow = Graph(name, [
-        DoWhile("more", body=[Step("inc")], max_iterations=10),
-        Choose([Case(when="big", then=[Step("label-big")]), Case(then=[Step("label-small")])]),
-    ]).compile()
+    def body(f):
+        counted = f.repeat_while("more", lambda b: b.then_apply("inc"), max_iterations=10)
+        return Wiggle.one_of(counted.when("big").then_apply("label-big"),
+                             counted.otherwise().then_apply("label-small"))
+    flow = FlowSpec.define(name, body)
     w = (Worker(client, "it-loop", concurrency=2, long_poll_wait_s=1)
          .handle(name, "inc", lambda c: {**c, "i": c["i"] + 1})
          .handle_gate(name, "more", lambda c: c["i"] < 4)
@@ -91,8 +91,8 @@ def test_choose_and_do_while(client):
 
 def test_signal_and_sleep(client):
     name = _name("py-it-signal")
-    flow = Graph(name, [Sleep("nap", millis=100), AwaitSignal("approve", timeout_s=30),
-                        Step("finish")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_sleep(millis=100, name="nap")
+                           .then_await("approve", timeout_s=30).then_apply("finish"))
     client.register(flow)
     w = Worker(client, "it-signal", concurrency=2, long_poll_wait_s=1) \
         .handle(name, "finish", lambda c: {**c, "done": True})
@@ -114,9 +114,9 @@ def test_signal_and_sleep(client):
 
 def test_sub_workflow(client):
     child, parent = _name("py-it-child"), _name("py-it-parent")
-    child_flow = Graph(child, [Step("work")]).compile()
+    child_flow = FlowSpec.define(child, lambda f: f.then_apply("work"))
     client.register(child_flow)
-    flow = Graph(parent, [SubWorkflow("child", child), Step("after")]).compile()
+    flow = FlowSpec.define(parent, lambda f: f.then_sub_flow("child", child).then_apply("after"))
     w = (Worker(client, "it-sub", concurrency=2, long_poll_wait_s=1)
          .handle(child, "work", lambda c: {**c, "child": True})
          .handle(parent, "after", lambda c: {**c, "after": True}))
@@ -127,7 +127,8 @@ def test_sub_workflow(client):
 
 def test_compensation(client):
     name = _name("py-it-saga")
-    flow = Graph(name, [Step("reserve", compensate=True), Step("overwrite"), Step("boom")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply_compensable("reserve").then_apply("overwrite")
+                           .then_apply("boom"))
     undone = []
 
     def boom(c):
@@ -146,7 +147,7 @@ def test_compensation(client):
 
 def test_retry_then_success_reports_the_attempt(client):
     name = _name("py-it-retry")
-    flow = Graph(name, [Step("flaky")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("flaky"))
 
     def flaky(c):
         if step.attempt() < 2:
@@ -163,7 +164,7 @@ def test_emitted_events_reach_the_feed_and_timings_feed_step_stats(client):
     name = _name("py-it-events")
     consumer = name + "-feed"
     client.poll_events(consumer, max_events=1, wait_s=0, start_from=-1)   # register the cursor
-    flow = Graph(name, [Step("ship")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("ship"))
 
     def ship(c):
         step.emit("order.shipped", {"attempt": step.attempt(), "step": step.name()})

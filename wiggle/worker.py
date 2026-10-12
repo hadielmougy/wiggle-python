@@ -67,7 +67,7 @@ _canonical = _binder.canonical   # re-exported: step-name folding lives in wiggl
 
 class Worker:
     """Bind handlers to workflow steps by name, then :meth:`start` to pull and run work. Topology is
-    registered separately (``client.register`` of a compiled :class:`Graph`, or the ``wiggle`` CLI).
+    registered separately (``client.register`` of a :meth:`FlowSpec.define`, or the ``wiggle`` CLI).
 
     >>> worker = Worker(client, "worker-1").handle("order", "validate", validate)
     >>> worker.start()          # background threads; call close() to drain
@@ -131,7 +131,7 @@ class Worker:
         return self._bind(workflow, step, "COMBINE", wrapper)
 
     def handle_compensation(self, workflow: str, step: str, fn: Callable) -> "Worker":
-        """Bind the undo of a compensable step (one declared ``compensate=True`` in the topology).
+        """Bind the undo of a compensable step (one recorded with ``then_apply_compensable``).
         ``fn`` receives a :class:`wiggle.Compensation` (the step's input/result snapshots) and runs
         in the reverse pass after the instance fails. ``start`` refuses a worker that serves a
         compensable step's forward handler without also binding its compensator — the undo task is
@@ -279,7 +279,7 @@ class Worker:
                 if kind == "COMPENSATE":
                     if node["kind"] != "TASK" or is_combine or not node.get("compensable"):
                         raise ValueError(f"step '{step}' of workflow '{wf}' is not declared "
-                                         f"compensate=True in the topology; handle_compensation "
+                                         f"compensable in the topology; handle_compensation "
                                          f"binds only compensable steps")
                 elif kind == "COMBINE":
                     if not is_combine:
@@ -305,7 +305,7 @@ class Worker:
                 node = nodes.get(f"{w}#{step}")
                 if node is not None and node.get("compensable"):
                     raise ValueError(f"step '{step}' of workflow '{wf}' is declared "
-                                     f"compensate=True but this worker binds no compensator; add "
+                                     f"compensable but this worker binds no compensator; add "
                                      f"handle_compensation('{wf}', '{step}', ...)")
             unclaimed = sorted(a.split("#", 1)[1] for a in set(nodes) - served)
             if unclaimed:   # info, not an error: a polyglot worker may intentionally serve a subset

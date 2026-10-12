@@ -1,26 +1,22 @@
-"""The workflow topology as declarative data: describe a graph of steps, gates, timers, signal waits,
-parallel ``Fork`` and exclusive ``Choose`` as a :class:`Graph` of :class:`Node` values that mirror the
-YAML/graph schema, then :meth:`Graph.compile` it into a :class:`FlowSpec` you register and start.
+"""The workflow topology: :meth:`FlowSpec.define` records a chain of steps (see :mod:`wiggle.flow`)
+and compiles it, through the private node stream below, into the graph definition the server stores.
 
 Handlers are **not** part of the topology -- a :class:`~wiggle.worker.Worker` binds them separately, by
 name (``handle`` / ``handle_gate`` / ``handle_effect``). The graph lives on the server; any worker that
 implements the matching activity names can run its steps, so Python, Java, and Go workers interoperate.
 
 The context is a plain ``dict`` that flows through the steps. A handler returns the *whole* context
-(usually ``{**ctx, ...}``); the engine merges only what changed, so parallel branches that touch
-different fields merge cleanly.
+(usually ``{**ctx, ...}``); the engine replaces the context with it.
 
-    from wiggle import Graph, Step, Gate, Effect, Fork, Branch, RetryPolicy
+    from wiggle import FlowSpec, RetryPolicy, Wiggle
 
-    wf = Graph("order", [
-        Step("validate"),
-        Gate("in-stock"),
-        Fork([
-            Branch("payment",  [Step("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1))]),
-            Branch("shipping", [Step("reserve"), Step("label")]),
-        ]),
-        Effect("notify"),
-    ]).compile()
+    def order(f):
+        validated = f.then_apply("validate").then_filter("in-stock")
+        payment = validated.then_apply("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1))
+        shipping = validated.then_apply("reserve").then_apply("label")
+        return Wiggle.all_of(payment, shipping).combine("merge").then_accept("notify")
+
+    wf = FlowSpec.define("order", order)
 """
 from __future__ import annotations
 
@@ -84,54 +80,31 @@ class RetryPolicy:
         return RetryPolicy(max_attempts, backoff_s, 1.0, backoff_s, 0.0)
 
 
-# ---- the declarative node types (mirror the graph schema) ----
+# ---- the recorded topology: what a WiggleFlow chain compiles to before it becomes graph rows ----
 
 
-class Node:
-    """Base class for a topology node. A workflow's ``steps`` is a list of these."""
-
-
-@dataclass
-class Step(Node):
-    """A unit of work run on a worker; its handler returns the new context (only changed keys merge
-    back). Bind it with ``Worker.handle``.
-
-    ``compensate=True`` declares the step compensable: if the instance later fails, the engine
-    runs the step's compensator (bound with ``Worker.handle_compensation`` or a
-    ``compensate_<step>`` method on a handlers object) in the reverse pass, handing it the
-    input/result context snapshots captured at this step's completion.
-
-    ``combine`` makes the step a spawning step: its handler may ``wiggle.step.create`` branches,
-    and the combine step ``combine`` (bound with ``Worker.handle_combine``) receives their results
-    under this step's name and returns the post-join context. The combine always runs, with an
-    empty collection when the step created nothing, and may itself create the next round."""
-
-    name: str
-    queue: Optional[str] = None      # None -> the default queue
-    retry: Optional[RetryPolicy] = None    # None -> default (retry forever)
-    compensate: bool = False         # declare an undo; a compensator MUST be bound for this step
-    combine: str = ""                # a spawning step: the combine its created branches rejoin at
+class _Node:
+    """One element of a compiled node stream; the builder below turns a list of these into graph rows."""
 
 
 @dataclass
-class Effect(Node):
-    """A step run for its side effect only; the context is unchanged. Bind it with
-    ``Worker.handle_effect``. (Topologically identical to a :class:`Step`.) ``compensate``
-    declares an undo exactly as on a :class:`Step` (for an effect the two snapshots are the
-    same context). ``combine`` makes it a spawning step, as on a :class:`Step`."""
+class _Task(_Node):
+    """A step run on a worker (``then_apply`` / ``then_accept``). ``combine`` makes it a spawning
+    step: the branches its handler creates rejoin at that combine."""
 
     name: str
     queue: Optional[str] = None
     retry: Optional[RetryPolicy] = None
     compensate: bool = False
     combine: str = ""
+    combine_queue: Optional[str] = None
+    combine_retry: Optional[RetryPolicy] = None
 
 
 @dataclass
-class Gate(Node):
-    """A predicate: continue only while it holds; a false result ends the instance as ``gated:<name>``
-    (inside a fork/choose branch it short-circuits to the enclosing join). Bind it with
-    ``Worker.handle_gate``."""
+class _Gate(_Node):
+    """A predicate (``then_filter``): false ends the instance as ``gated:<name>``, or inside a branch
+    short-circuits to that branch's join."""
 
     name: str
     queue: Optional[str] = None
@@ -139,117 +112,113 @@ class Gate(Node):
 
 
 @dataclass
-class Sleep(Node):
-    """A server-side timer; no worker is held while the instance waits."""
-
+class _Sleep(_Node):
     name: str
-    seconds: float = 0.0
     millis: int = 0
 
 
 @dataclass
-class AwaitSignal(Node):
-    """Wait for a named external signal (delivered via :meth:`WiggleClient.signal`); the payload merges
-    into the context like a step's result. With a positive ``timeout_s`` the instance **fails** if the
-    signal does not arrive in time -- unless an ``escalation`` list is given, in which case those nodes
-    run instead on timeout and then rejoin the flow (exactly one of delivery / escalation happens)."""
-
+class _AwaitSignal(_Node):
     name: str
     timeout_s: float = 0.0
-    escalation: Optional[list["Node"]] = None
+    escalation: Optional[list[_Node]] = None
 
 
 @dataclass
-class SubWorkflow(Node):
-    """Run another registered workflow as a child: it starts with this instance's context, and on
-    completion its final context merges back here. The child must be registered separately; ``workflow``
-    is its name (or a :class:`FlowSpec` / :class:`Graph` to take the name from)."""
-
+class _SubWorkflow(_Node):
     name: str
-    workflow: "Union[str, FlowSpec, Graph]"
+    workflow: str
 
 
 @dataclass
-class Branch:
-    """One parallel arm of a :class:`Fork` (a name plus its own list of nodes)."""
+class _Fork(_Node):
+    """Parallel arms on isolated context copies, rejoined at the mandatory ``combine``."""
 
-    name: str
-    steps: list["Node"]
-
-
-@dataclass
-class Fork(Node):
-    """Fan out into parallel branches and wait for all of them (join). Needs >= 2 branches.
-
-    ``combine`` names the MANDATORY merge step run after the join: its handler receives the context
-    with each branch's result staged under the branch's name, and must return the COMPLETE
-    post-join context -- the engine replaces the context with it, so keys the handler omits do not
-    survive the join. There is no implicit fold of the arms. Bind it with
-    :meth:`wiggle.worker.Worker.handle_combine` (or a :class:`Handlers` method matched by name)."""
-
-    branches: list[Branch]
+    arms: list[tuple[str, list[_Node]]]
     combine: str = ""
+    combine_queue: Optional[str] = None
+    combine_retry: Optional[RetryPolicy] = None
 
 
 @dataclass
-class ForEach(Node):
-    """Runtime fan-out: at run time the engine reads the collection in the context at ``items_key`` (a
-    list or a map) and spawns one parallel branch per element, each on its own ISOLATED copy of the
-    context with the element injected under ``as_`` (its index under ``as_ + "Index"`` and, for a
-    map, its key under ``as_ + "Key"``). Item writes never touch the shared context. ``combine``
-    names the MANDATORY merge step: its handler receives the context with every item's final
-    context collected under ``name`` — a list ordered by item index for a list input, a map keyed
-    like the input for a map input — and must return the COMPLETE post-join context (the engine
-    replaces the context with it). An empty collection skips the body and the combine."""
+class _ForEach(_Node):
+    """One isolated branch per element of the collection at ``items_key``, rejoined at ``combine``."""
 
     name: str
-    items_key: str           # the context key holding the collection
-    body: list["Node"]
+    items_key: str
+    body: list[_Node]
     combine: str = ""
+    combine_queue: Optional[str] = None
+    combine_retry: Optional[RetryPolicy] = None
 
 
 @dataclass
-class Case:
-    """One arm of a :class:`Choose`. ``when is None`` marks the ``otherwise`` default (which must be
-    last); otherwise ``when`` is the name of the guard predicate."""
+class _Case:
+    """One arm of a choice; ``when is None`` is the otherwise arm, which must be last."""
 
-    then: list["Node"]
+    then: list[_Node]
     when: Optional[str] = None
+    queue: Optional[str] = None
+    retry: Optional[RetryPolicy] = None
 
 
 @dataclass
-class Choose(Node):
-    """Exclusive choice: the first :class:`Case` whose guard holds runs, the rest are skipped. A cascade
-    of guards -- nothing runs in parallel and there is no join."""
-
-    cases: list[Case]
+class _Choose(_Node):
+    cases: list[_Case]
 
 
 @dataclass
-class DoWhile(Node):
-    """A do-while loop: run ``body`` once, then evaluate the ``condition`` predicate on a worker; while it
-    holds, the body runs again (the body always runs at least once).
-
-    Every loop is budgeted: the guard may evaluate true at most ``max_iterations`` times, after
-    which the instance FAILS with a clear error -- an unbounded loop with a buggy condition would
-    hot-spin workers and the database. ``0`` means the engine default
-    (``WIGGLE_LOOP_MAX_ITERATIONS``, 10,000); set it explicitly when a loop legitimately needs
-    more."""
+class _DoWhile(_Node):
+    """Run ``body``, then again while ``condition`` holds; ``max_iterations`` 0 = engine default."""
 
     condition: str
-    body: list["Node"]
+    body: list[_Node]
     max_iterations: int = 0
+    queue: Optional[str] = None
+
+
+@dataclass
+class _DefaultQueue(_Node):
+    """Sets the queue of every step after it that names none."""
+
+    queue: str
+
+
+@dataclass
+class _DeclareAttribute(_Node):
+    attribute: "Attribute"
 
 
 @dataclass
 class FlowSpec:
     """A compiled workflow: the definition sent to the server (topology only). Handlers are bound
-    separately on a worker, by name."""
+    separately on a worker, by name. Make one with :meth:`define`."""
 
     name: str
     version: int
     definition: dict
     queues: list[str]
+
+    @staticmethod
+    def define(name: str, body: "Callable[[WiggleFlow], Any]", *, version: Optional[int] = None,
+               default_retry: Optional[RetryPolicy] = None) -> "FlowSpec":
+        """Defines a workflow as a chain of steps, as ``FlowSpec.define`` does in the Java client.
+
+        ``body`` receives a :class:`~wiggle.flow.WiggleFlow` at the start of the flow and records
+        steps on it; it runs once, here, and nothing in it executes a step::
+
+            FlowSpec.define("order", lambda f: f
+                .then_apply("validate")
+                .then_filter("in-stock")
+                .then_accept("notify"))
+
+        ``version`` pins an explicit version instead of the default content hash of the graph's
+        structure. With one, **you** own bumping it when the graph changes: the server overwrites
+        the stored graph for a reused version, which affects instances already running on it.
+        ``default_retry`` applies to every step that names no retry policy (default: retry
+        forever)."""
+        from .flow import _define
+        return _define(name, body, version, default_retry)
 
 
 _ATTRIBUTE_NAME = re.compile(r"[a-z][a-z0-9_]{0,62}")
@@ -291,63 +260,52 @@ class Attribute:
         return {"name": self.name, "type": self.type, "path": self.path}
 
 
-@dataclass
-class Graph:
-    """A workflow's topology as declarative data. ``compile()`` validates the shape and turns it into a
-    :class:`FlowSpec` you register and start.
+def _compile(name: str, nodes: list[_Node], version: Optional[int],
+             default_retry: Optional[RetryPolicy]) -> FlowSpec:
+    """Turns a recorded node stream into the definition the server stores."""
+    if not name or not name.strip():
+        raise ValueError("workflow name is required")
+    if not nodes or all(isinstance(n, (_DefaultQueue, _DeclareAttribute)) for n in nodes):
+        raise ValueError(f"workflow '{name}' has no steps")
 
-    ``version`` pins an explicit version instead of the auto content hash. Use it to choose a stable,
-    human-meaningful number (or to match another client) -- but then **you** own bumping it when the
-    graph changes: the server overwrites the stored graph for a reused version, which affects instances
-    already running on it. Leave it unset for the safe content-addressed default.
-    """
+    graph = _Graph(name, name, default_retry)
+    root = _Builder(graph, enclosing_join=None, is_root=True)
+    root.append_nodes(nodes)
+    end_id = graph.add_end()
+    root.wire_open_to(end_id)
+    if graph.start_node is None:
+        graph.start_node = end_id
 
-    name: str
-    steps: list[Node] = field(default_factory=list)
-    version: Optional[int] = None
-    default_queue: Optional[str] = None
-    attributes: list[Attribute] = field(default_factory=list)   # values queue criteria can test
+    attributes = graph.attributes
+    if len(attributes) > MAX_ATTRIBUTES:
+        raise ValueError(f"a workflow declares at most {MAX_ATTRIBUTES} attributes, "
+                         f"got {len(attributes)}")
+    if len({a.name for a in attributes}) != len(attributes):
+        raise ValueError("an attribute is declared twice")
 
-    def compile(self) -> FlowSpec:
-        if not self.name or not self.name.strip():
-            raise ValueError("workflow name is required")
-        if not self.steps:
-            raise ValueError("workflow has no steps")
-        if len(self.attributes) > MAX_ATTRIBUTES:
-            raise ValueError(f"a workflow declares at most {MAX_ATTRIBUTES} attributes, "
-                             f"got {len(self.attributes)}")
-        if len({a.name for a in self.attributes}) != len(self.attributes):
-            raise ValueError("an attribute is declared twice")
-
-        graph = _Graph(self.name, self.default_queue or self.name)
-        root = _Builder(graph, enclosing_join=None, is_root=True)
-        root.append_nodes(self.steps)
-        end_id = graph.add_end()
-        root.wire_open_to(end_id)
-        if graph.start_node is None:
-            graph.start_node = end_id
-
-        queues = sorted(graph.queues)
-        definition = {
-            "name": self.name,
-            "startNode": graph.start_node,
-            "nodes": list(graph.nodes.values()),
-            "queues": queues,
-            "executionMode": "SERVER",
-        }
-        if self.attributes:
-            definition["attributes"] = [a.to_json() for a in self.attributes]
-        version = _check_version(self.version) if self.version is not None else _content_version(definition)
-        definition = {"version": version, **definition}
-        return FlowSpec(self.name, version, definition, queues)
+    queues = sorted(graph.queues)
+    definition = {
+        "name": name,
+        "startNode": graph.start_node,
+        "nodes": list(graph.nodes.values()),
+        "queues": queues,
+        "executionMode": "SERVER",
+    }
+    if attributes:
+        definition["attributes"] = [a.to_json() for a in attributes]
+    version = _check_version(version) if version is not None else _content_version(definition)
+    definition = {"version": version, **definition}
+    return FlowSpec(name, version, definition, queues)
 
 
 class _Graph:
     """The accumulating node store shared by a workflow and all its nested branches."""
 
-    def __init__(self, name: str, default_queue: str):
+    def __init__(self, name: str, default_queue: str, default_retry: Optional[RetryPolicy]):
         self.name = name
         self.default_queue = default_queue
+        self.default_retry = default_retry or RetryPolicy.forever()
+        self.attributes: list[Attribute] = []
         self.nodes: dict[str, dict] = {}
         self.queues: set[str] = set()
         self.reserved: set[str] = set()
@@ -371,7 +329,7 @@ class _Graph:
         q = queue or self.default_queue
         self.queues.add(q)
         self.nodes[nid] = {"id": nid, "kind": kind, "name": name, "activity": f"{self.name}#{name}",
-                           "queue": q, "retry": (retry or RetryPolicy.forever()).to_json()}
+                           "queue": q, "retry": (retry or self.default_retry).to_json()}
         return nid
 
     def add_timer(self, kind: str, name: str, millis: int, reserve: bool) -> str:
@@ -403,25 +361,28 @@ class _Graph:
                            "itemsKey": items_key, "itemKey": item_key}
         return nid
 
-    def add_combine(self, name: str, arms: list[str]) -> str:
+    def add_combine(self, name: str, arms: list[str], queue: Optional[str],
+                    retry: Optional[RetryPolicy]) -> str:
         """The mandatory merge node after a fork's join: a TASK bound by name like any step, carrying
         the fork's ``armNames`` so the engine can stage each isolated branch's result for the
         handler, and strip it afterward."""
-        nid = self.add_worker("TASK", name, None, None)
+        nid = self.add_worker("TASK", name, queue, retry)
         self.nodes[nid]["armNames"] = list(arms)
         return nid
 
-    def add_for_each_combine(self, name: str, for_each_name: str) -> str:
+    def add_for_each_combine(self, name: str, for_each_name: str, queue: Optional[str],
+                             retry: Optional[RetryPolicy]) -> str:
         """The mandatory merge node after a forEach's join: a TASK bound by name whose ``collectKey``
         is the scratch key the engine stages the collected item results under."""
-        nid = self.add_worker("TASK", name, None, None)
+        nid = self.add_worker("TASK", name, queue, retry)
         self.nodes[nid]["collectKey"] = FOR_EACH_SCRATCH_PREFIX + for_each_name
         return nid
 
-    def add_spawn_combine(self, name: str, step_name: str) -> str:
+    def add_spawn_combine(self, name: str, step_name: str, queue: Optional[str],
+                          retry: Optional[RetryPolicy]) -> str:
         """The combine after a spawning step: a TASK bound by name whose ``collectKey`` stages the
         results of the branches ``step_name`` created."""
-        nid = self.add_worker("TASK", name, None, None)
+        nid = self.add_worker("TASK", name, queue, retry)
         self.nodes[nid]["collectKey"] = SPAWN_SCRATCH_PREFIX + step_name
         return nid
 
@@ -449,7 +410,7 @@ class _Graph:
 
 
 class _Builder:
-    """Open-ends wiring over the declarative node list. One per node stream (the root, plus one per
+    """Open-ends wiring over a node stream. One per node stream (the root, plus one per
     nested branch / case / body); they all share a single :class:`_Graph`."""
 
     def __init__(self, graph: _Graph, enclosing_join: Optional[str], is_root: bool = False):
@@ -482,12 +443,12 @@ class _Builder:
             self.g.wire(nid, edge, target)
         self.open = []
 
-    def append_nodes(self, nodes: list[Node]) -> None:
+    def append_nodes(self, nodes: list[_Node]) -> None:
         for n in nodes:
             self.append_node(n)
 
-    def append_node(self, n: Node) -> None:
-        if isinstance(n, (Step, Effect)):
+    def append_node(self, n: _Node) -> None:
+        if isinstance(n, _Task):
             nid = self.g.add_worker("TASK", n.name, n.queue, n.retry)
             if n.compensate:
                 self.g.nodes[nid]["compensable"] = True
@@ -495,38 +456,42 @@ class _Builder:
             if n.combine:
                 join_id = self.g.add_join(0)                  # 0 = as many as the step creates
                 self.chain(join_id)
-                self.chain(self.g.add_spawn_combine(n.combine, n.name))
-        elif isinstance(n, Gate):
+                self.chain(self.g.add_spawn_combine(n.combine, n.name, n.combine_queue, n.combine_retry))
+        elif isinstance(n, _Gate):
             nid = self.g.add_worker("PREDICATE", n.name, n.queue, n.retry)
             self.attach(nid)
             target = self.enclosing_join if self.enclosing_join is not None else self.g.add_end(f"gated:{n.name}")
             self.g.wire(nid, "alt", target)
             self.open = [(nid, "next")]
-        elif isinstance(n, Sleep):
-            self.chain(self.g.add_timer("SLEEP", n.name, int(n.seconds * 1000) + int(n.millis), reserve=False))
-        elif isinstance(n, AwaitSignal):
+        elif isinstance(n, _Sleep):
+            self.chain(self.g.add_timer("SLEEP", n.name, n.millis, reserve=False))
+        elif isinstance(n, _AwaitSignal):
             self._append_await_signal(n)
-        elif isinstance(n, SubWorkflow):
-            self.chain(self.g.add_subworkflow(n.name, _child_name(n.workflow)))
-        elif isinstance(n, Fork):
+        elif isinstance(n, _SubWorkflow):
+            self.chain(self.g.add_subworkflow(n.name, n.workflow))
+        elif isinstance(n, _Fork):
             self._append_fork(n)
-        elif isinstance(n, ForEach):
+        elif isinstance(n, _ForEach):
             self._append_for_each(n)
-        elif isinstance(n, Choose):
+        elif isinstance(n, _Choose):
             self._append_choose(n)
-        elif isinstance(n, DoWhile):
+        elif isinstance(n, _DoWhile):
             self._append_do_while(n)
+        elif isinstance(n, _DefaultQueue):
+            self.g.default_queue = n.queue
+        elif isinstance(n, _DeclareAttribute):
+            self.g.attributes.append(n.attribute)
         else:
             raise TypeError(f"not a workflow node: {n!r}")
 
-    def _append_await_signal(self, n: AwaitSignal) -> None:
+    def _append_await_signal(self, n: _AwaitSignal) -> None:
         nid = self.g.add_timer("SIGNAL", n.name, int(n.timeout_s * 1000), reserve=True)
         self.attach(nid)
         if n.escalation is None:
             self.open = [(nid, "next")]                       # delivery path only
             return
         if n.timeout_s <= 0:
-            raise ValueError("await_signal escalation needs a positive timeout_s")
+            raise ValueError("then_await escalation needs a positive timeout_s")
         # delivery path is `next`; the escalation branch hangs off `alt` and its tail rejoins, so both
         # continue to whatever follows -- the SIGNAL next/altNext shape the Java client emits.
         sub = self.sub(self.enclosing_join)
@@ -536,43 +501,44 @@ class _Builder:
         self.g.wire(nid, "alt", sub.start)
         self.open = [(nid, "next"), *sub.open]
 
-    def _append_fork(self, n: Fork) -> None:
-        if len(n.branches) < 2:
-            raise ValueError("fork needs at least two branches")
+    def _append_fork(self, n: _Fork) -> None:
+        if len(n.arms) < 2:
+            raise ValueError("all_of needs at least two arms")
         if not n.combine:
-            raise ValueError("fork needs a combine step name (Fork(..., combine=...)): branches "
-                             "rejoin at an explicit merge handler; there is no implicit fold")
+            raise ValueError("all_of needs a combine: arms rejoin at an explicit merge handler; "
+                             "there is no implicit fold")
         fork_id = self.g.add_fork()
         self.attach(fork_id)
-        join_id = self.g.add_join(len(n.branches))
-        starts = [self._build_branch(b, join_id) for b in n.branches]
+        join_id = self.g.add_join(len(n.arms))
+        starts = [self._build_branch(arm, steps, join_id) for arm, steps in n.arms]
         self.g.set_branches(fork_id, starts)
-        combine_id = self.g.add_combine(n.combine, [b.name for b in n.branches])
+        combine_id = self.g.add_combine(n.combine, [arm for arm, _ in n.arms],
+                                        n.combine_queue, n.combine_retry)
         self.g.wire(join_id, "next", combine_id)
         self.open = [(combine_id, "next")]
 
-    def _append_for_each(self, n: ForEach) -> None:
+    def _append_for_each(self, n: _ForEach) -> None:
         if not n.combine:
-            raise ValueError("for_each needs a combine step name (ForEach(..., combine=...)): item "
-                             "results rejoin at an explicit merge handler; there is no implicit fold")
+            raise ValueError(f"then_for_each '{n.name}' needs a combine: item results rejoin at an "
+                             f"explicit merge handler; there is no implicit fold")
         fork_id = self.g.add_dynfork(n.name, n.items_key, n.items_key)
         self.attach(fork_id)
         join_id = self.g.add_join(0)                          # 0 = dynamic width
-        template_start = self._build_branch(Branch(n.name, n.body), join_id)
+        template_start = self._build_branch(n.name, n.body, join_id)
         self.g.set_branches(fork_id, [template_start])
         self.g.wire(fork_id, "next", join_id)   # empty-collection skip (past the combine, engine-side)
-        combine_id = self.g.add_for_each_combine(n.combine, n.name)
+        combine_id = self.g.add_for_each_combine(n.combine, n.name, n.combine_queue, n.combine_retry)
         self.g.wire(join_id, "next", combine_id)
         self.open = [(combine_id, "next")]
 
-    def _append_do_while(self, n: DoWhile) -> None:
+    def _append_do_while(self, n: _DoWhile) -> None:
         sub = self.sub(self.enclosing_join)
         sub.append_nodes(n.body)
         if sub.start is None:
-            raise ValueError("do_while body defines no steps")
+            raise ValueError(f"the body of repeat_while '{n.condition}' defines no steps")
         if n.max_iterations < 0:
-            raise ValueError(f"do_while '{n.condition}': max_iterations must be positive (0 = engine default)")
-        cond_id = self.g.add_worker("PREDICATE", n.condition, None, None)
+            raise ValueError(f"repeat_while '{n.condition}': max_iterations must be positive (0 = engine default)")
+        cond_id = self.g.add_worker("PREDICATE", n.condition, n.queue, None)
         # -1 = the engine-default budget sentinel, mirroring the Java client's two-arg doWhile.
         self.g.nodes[cond_id]["loopBudget"] = n.max_iterations if n.max_iterations > 0 else -1
         self.attach(sub.start)                                # enter at the body
@@ -580,12 +546,13 @@ class _Builder:
         self.g.wire(cond_id, "next", sub.start)               # true: loop back to the body
         self.open = [(cond_id, "alt")]                        # false: continue onward
 
-    def _append_choose(self, n: Choose) -> None:
+    def _append_choose(self, n: _Choose) -> None:
         cases = n.cases
         has_default = _validate_choose(cases)
         n_guards = len(cases) - (1 if has_default else 0)
 
-        guard_ids = [self.g.add_worker("PREDICATE", cases[i].when, None, None) for i in range(n_guards)]
+        guard_ids = [self.g.add_worker("PREDICATE", cases[i].when, cases[i].queue, cases[i].retry)
+                     for i in range(n_guards)]
         self.attach(guard_ids[0])
         self.open = []
         for i in range(n_guards - 1):                         # each guard's false path -> next guard
@@ -599,45 +566,33 @@ class _Builder:
         else:
             self.open.append((last, "alt"))                   # no match skips the choose entirely
 
-    def _build_branch(self, branch: Branch, join_id: str) -> str:
+    def _build_branch(self, name: str, steps: list[_Node], join_id: str) -> str:
         sub = self.sub(join_id)
-        sub.append_nodes(branch.steps)
+        sub.append_nodes(steps)
         if sub.start is None:
-            raise ValueError(f"branch '{branch.name}' defines no steps")
+            raise ValueError(f"branch '{name}' defines no steps")
         sub.wire_open_to(join_id)
         return sub.start
 
-    def _collect_case(self, case: Case, guard_id: str, edge: str) -> None:
+    def _collect_case(self, case: _Case, guard_id: str, edge: str) -> None:
         sub = self.sub(self.enclosing_join)
         sub.append_nodes(case.then)
         if sub.start is None:
-            raise ValueError("a choose case defines no steps")
+            raise ValueError("an arm of one_of defines no steps")
         self.g.wire(guard_id, edge, sub.start)
         self.open.extend(sub.open)
 
 
-def _validate_choose(cases: list[Case]) -> bool:
+def _validate_choose(cases: list[_Case]) -> bool:
     if not cases:
-        raise ValueError("choose needs at least one case")
+        raise ValueError("one_of needs at least one arm")
     for c in cases[:-1]:
         if c.when is None:
-            raise ValueError("the otherwise (default) case must be last")
+            raise ValueError("otherwise() must be the last arm of one_of")
     has_default = cases[-1].when is None
     if has_default and len(cases) == 1:
-        raise ValueError("choose needs at least one guarded case")
+        raise ValueError("one_of needs an arm opened with when(...)")
     return has_default
-
-
-def _child_name(workflow: "Union[str, FlowSpec, Graph]") -> str:
-    if isinstance(workflow, str):
-        child = workflow
-    elif isinstance(workflow, (FlowSpec, Graph)):
-        child = workflow.name
-    else:
-        raise TypeError("workflow must be a Graph, FlowSpec, or workflow name")
-    if not child:
-        raise ValueError("child workflow name is required")
-    return child
 
 
 _MAX_VERSION = 0x7FFFFFFF
