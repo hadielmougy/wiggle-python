@@ -1,9 +1,9 @@
 """Wiggle — Python client and worker for the Wiggle workflow engine.
 
-    from wiggle import Graph, Step, Gate, Effect, RetryPolicy, WiggleClient, Worker
+    from wiggle import FlowSpec, RetryPolicy, Wiggle, WiggleClient, Worker
 
-Describe a workflow's topology as declarative data (a Graph of nodes), compile and register it, start
-instances from the client, and implement its steps with a worker that binds handlers by name. Talks the
+Define a workflow as a chain of steps (``FlowSpec.define``), register it, start instances from the
+client, and implement its steps with a worker that binds handlers by name. Talks the
 same gRPC control plane as the Java and Go clients, so their workers interoperate.
 """
 from .client import (
@@ -20,44 +20,16 @@ from .client import (
 from .worker import Compensation, Handlers, PermanentActivityError, Worker, for_flow
 from . import criteria, step  # noqa: F401  (wiggle.step.create() et al., wiggle.criteria)
 from .branch import Branch as CreatedBranch, BranchError
-from .workflow import (
-    AttrType,
-    AwaitSignal,
-    FlowSpec,
-    Branch,
-    Case,
-    Choose,
-    DoWhile,
-    Effect,
-    Fork,
-    ForEach,
-    Gate,
-    Attribute,
-    Graph,
-    Node,
-    RetryPolicy,
-    Sleep,
-    Step,
-    SubWorkflow,
-)
+from .flow import Arms, Items, Wiggle, WiggleFlow
+from .workflow import AttrType, FlowSpec, RetryPolicy
 
 __all__ = [
-    "Graph",
-    "Node",
-    "Step",
-    "Effect",
-    "Gate",
-    "Sleep",
-    "AwaitSignal",
-    "SubWorkflow",
-    "Fork",
-    "Branch",
-    "ForEach",
-    "Choose",
-    "Case",
-    "DoWhile",
-    "RetryPolicy",
     "FlowSpec",
+    "WiggleFlow",
+    "Wiggle",
+    "Arms",
+    "Items",
+    "RetryPolicy",
     "WiggleClient",
     "InstanceView",
     "ScheduleView",
@@ -67,7 +39,6 @@ __all__ = [
     "StepStats",
     "BacklogCoverage",
     "ReportRefused",
-    "Attribute",
     "AttrType",
     "CreatedBranch",
     "BranchError",

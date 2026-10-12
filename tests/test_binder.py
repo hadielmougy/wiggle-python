@@ -3,7 +3,7 @@ rule is testable with no server, no worker, no I/O. Mirrors the Java client's Ha
 import pytest
 
 from wiggle import _binder
-from wiggle.workflow import Branch, Fork, Gate, Graph, Step
+from wiggle import FlowSpec, Wiggle
 
 
 # ---------------------------------------------------------------- scan
@@ -41,7 +41,8 @@ def test_scan_skips_underscore_helpers_and_workflow_attr():
 # ---------------------------------------------------------------- bind: kinds & wiring
 
 def _linear():
-    return Graph("wf", [Step("work", queue="special"), Gate("ok"), Step("other")]).compile().definition
+    return FlowSpec.define("wf", lambda f: f.then_apply("work", queue="special").then_filter("ok")
+                           .then_apply("other")).definition
 
 
 def test_bind_kinds_queues_and_unserved():
@@ -92,9 +93,8 @@ def test_bind_rejects_a_handler_matching_no_step():
 # ---------------------------------------------------------------- combines
 
 def _forked():
-    return Graph("wf", [
-        Fork([Branch("a", [Step("a1")]), Branch("b", [Step("b1")])], combine="merge"),
-    ]).compile().definition
+    return FlowSpec.define("wf", lambda f: Wiggle.all_of(f.then_apply("a1"), f.then_apply("b1"))
+                           .combine("merge")).definition
 
 
 def test_fork_combine_returns_verbatim():
@@ -154,8 +154,8 @@ def test_unstage_leaves_other_steps_alone():
 # ---------------------------------------------------------------- compensation pairing
 
 def _saga():
-    return Graph("saga", [Step("reserve", compensate=True), Step("charge", queue="payments")]) \
-        .compile().definition
+    return FlowSpec.define("saga", lambda f: f.then_apply_compensable("reserve")
+                           .then_apply("charge", queue="payments")).definition
 
 
 def test_compensator_binds_and_splits_snapshots():
@@ -198,7 +198,7 @@ def test_compensator_on_non_compensable_step_refuses_to_bind():
 
 
 def test_step_literally_named_compensate_x_stays_a_forward_handler():
-    graph = Graph("wf", [Step("compensate-order")]).compile().definition
+    graph = FlowSpec.define("wf", lambda f: f.then_apply("compensate-order")).definition
 
     class H:
         def compensate_order(self, ctx): return {**ctx, "handled": True}

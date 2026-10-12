@@ -5,18 +5,17 @@
 """
 import os
 
-from wiggle import Effect, Gate, Graph, RetryPolicy, Step, WiggleClient, Worker
+from wiggle import FlowSpec, RetryPolicy, WiggleClient, Worker
 
 
-def topology() -> "Graph":
-    # Declarative topology -- a Graph that mirrors the YAML/graph schema. Handlers bind by name below.
-    return Graph("py-order", [
-        Step("validate"),
-        Gate("in-stock"),
-        Step("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1)),
-        Step("ship"),
-        Effect("notify"),
-    ])
+def topology() -> FlowSpec:
+    # The topology as a chain of named steps; nothing runs here. Handlers bind by name below.
+    return FlowSpec.define("py-order", lambda f: f
+                           .then_apply("validate")
+                           .then_filter("in-stock")
+                           .then_apply("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1))
+                           .then_apply("ship")
+                           .then_accept("notify"))
 
 
 def bind(worker: Worker) -> Worker:
@@ -35,7 +34,7 @@ def bind(worker: Worker) -> Worker:
 
 def main() -> None:
     url = os.environ.get("WIGGLE_URL", "localhost:8080")
-    wf = topology().compile()
+    wf = topology()
     with WiggleClient(url) as client:
         client.register(wf)
         worker = bind(Worker(client, "py-worker-1")).start()

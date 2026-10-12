@@ -8,7 +8,7 @@ matching handlers can run its steps.
 - **Control client** — register workflows, start and track instances, deliver signals, manage schedules.
 - **Worker** — implement steps by name; pull tasks you have capacity for, run handlers, report results; automatic lease heartbeats and retries.
 - **Runtime branches & queue criteria** — open branches from inside a step (`wiggle.step.create`), and let a worker claim only the tasks a predicate selects.
-- **Declarative topology** — describe a workflow as a `Graph` of nodes (`Step`/`Gate`/`Sleep`/`Fork`/…) that mirror the graph schema, with optional per-step `retry` and `queue`.
+- **Flow definitions** — define a workflow as a chain of named steps (`FlowSpec.define(name, lambda f: f.then_apply(...)...)`), with the same vocabulary as the Java client and optional per-step `retry` and `queue`.
 
 ## Install
 
@@ -24,16 +24,15 @@ Requires Python 3.9+ and a running Wiggle server — see the [engine repo](https
 ## Quick start
 
 ```python
-from wiggle import Graph, Step, Gate, Effect, Sleep, RetryPolicy, WiggleClient, Worker
+from wiggle import FlowSpec, RetryPolicy, WiggleClient, Worker
 
-# 1. Describe the topology as declarative data -- a Graph that mirrors the graph schema.
-wf = Graph("order", [
-    Step("validate"),
-    Gate("in-stock"),                                   # false -> ends as gated:in-stock
-    Step("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1)),
-    Sleep("cool-off", seconds=1),
-    Effect("notify"),
-]).compile()
+# 1. Define the topology as a chain of named steps. Nothing runs here; it compiles to a graph.
+wf = FlowSpec.define("order", lambda f: f
+    .then_apply("validate")
+    .then_filter("in-stock")                            # false -> ends as gated:in-stock
+    .then_apply("charge", queue="payments", retry=RetryPolicy.exponential(5, 0.1))
+    .then_sleep(1)
+    .then_accept("notify"))
 
 # 2. Implement the steps by name. The context is a plain dict; a step returns the whole context.
 def charge(o):
@@ -65,75 +64,93 @@ python examples/polyglot_worker.py         # serve one step of a Java-authored f
 python examples/polyglot_typed_worker.py   # the same, for the Java typed-record demo
 ```
 
-## Topology
+## Defining a flow
 
-A workflow's shape is declarative data — a `Graph(name, steps)` whose `steps` is a list of `Node`
-values that mirror the graph schema. `compile()` validates the shape and returns a `FlowSpec` you
-register. Handlers are **not** part of the topology — a worker binds them separately, by name (below).
+`FlowSpec.define(name, body)` calls `body` once with a `WiggleFlow`, a handle on the start of the
+flow. Each `then_*` call records a step and returns a handle on the new end; the recording compiles
+to the `FlowSpec` you register. Steps are named as in the graph, and handlers are **not** part of
+it: a worker binds them separately, by those names (below). The vocabulary is the Java client's.
 
-| Node | Meaning |
+| Operator | Records |
 |---|---|
-| `Step(name, queue=None, retry=None, compensate=False, combine="")` | a task run on a worker (`handle`); its return replaces the context. `compensate=True` declares an undo run in the reverse pass if the instance later fails; `combine=` makes it a spawning step (see [Branches created at run time](#branches-created-at-run-time)) |
-| `Effect(name, queue=None, retry=None, compensate=False)` | a side-effect step (`handle_effect`); context unchanged |
-| `Gate(name, queue=None, retry=None)` | a predicate (`handle_gate`); false ends the instance as `gated:<name>` |
-| `Fork([Branch(name, steps), …], combine=…)` | run branches **in parallel** on isolated context copies, then rejoin at the **mandatory** `combine` step (`handle_combine`) — no implicit fold; needs ≥ 2 |
-| `ForEach(name, items_key, body, combine=…)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `items_key`. **The element IS the item's context** — body handlers receive the item's value (scalars included), their return replaces it, and the frozen base rides on `wiggle.step.base()`. The **mandatory** `combine` handler receives every item's final value collected under `name` and returns the complete post-join context |
-| `Choose([Case(when, then), …, Case(then)])` | exclusive choice: the first `Case` whose `when` guard holds runs; a `Case` with no `when` is the otherwise (last) |
-| `DoWhile(condition, body, max_iterations=0)` | run `body`, then repeat while the `condition` predicate holds (body runs at least once). The loop is budgeted: past `max_iterations` true guards the instance fails (`0` = engine default, 10,000) |
-| `SubWorkflow(name, workflow)` | run another workflow (a `FlowSpec`, `Graph`, or name) as a child; its result merges back |
-| `Sleep(name, seconds=, millis=)` | server-side timer; no worker is held |
-| `AwaitSignal(name, timeout_s=0, escalation=None)` | wait for a signal via `client.signal(...)`; on timeout, fail — or run the `escalation` nodes and rejoin |
+| `then_apply(name, queue=None, retry=None)` | a task (`handle`); its return replaces the context |
+| `then_apply_compensable(name, …)` | a task with an undo, run in the reverse pass if the instance later fails (see [Compensation](#compensation-sagas)) |
+| `then_accept(name, …)` | a side effect (`handle_effect`); context unchanged |
+| `then_filter(name, …)` | a gate (`handle_gate`); false ends the instance as `gated:<name>` |
+| `.combine(name, …)` after `then_apply`/`then_accept` | makes that step a spawning step (see [Branches created at run time](#branches-created-at-run-time)) |
+| `Wiggle.all_of(*arms).combine(name, …)` | run arms **in parallel** on isolated context copies, then rejoin at the **mandatory** combine (`handle_combine`); needs ≥ 2 |
+| `Wiggle.one_of(*arms)` | exclusive choice: each arm opens with `when(guard)` or, last, `otherwise()`; the first whose guard holds runs |
+| `then_for_each(items_key, body, name=None).combine(name, …)` | runtime fan-out: one **isolated** branch per element of the list (or map) at `items_key`, rejoined at the **mandatory** combine |
+| `repeat_while(condition, body, max_iterations=0, queue=None)` | run `body`, then repeat while the `condition` gate holds (body runs at least once). Past `max_iterations` true guards the instance fails (`0` = engine default, 10,000) |
+| `then_sub_flow(node, workflow)` | run another workflow (a `FlowSpec` or name) as a child; its result merges back |
+| `then_sleep(seconds=0, millis=0, name=None)` | server-side timer; no worker is held |
+| `then_await(signal, timeout_s=0, escalation=None)` | wait for a signal via `client.signal(...)`; on timeout, fail — or run the `escalation` body and rejoin |
+| `default_queue(queue)` | the queue of every later step that names none (before it: the workflow name) |
+| `attribute(name, type, path)` | a value [queue criteria](#queue-criteria) can test |
 
-A fork's combine is bound with `handle_combine(workflow, step, fn)`: `fn` receives the context with
-each branch's result staged under the branch's name, and must return the **complete** post-join
-context — the engine replaces the context with it, so keys the handler omits do not survive the
-join (there is no implicit union of the arms). The engine stages the arm results under reserved
-keys; the worker hands them to `fn` under the branch names, and fails the step if a branch name is
-also a key of the context itself (rename one of them):
+`body`, `escalation` and the loop and for-each bodies are functions that take a handle and chain
+steps onto it. `FlowSpec.define` also takes `version=` (see [Versioning](#versioning)) and
+`default_retry=`, the policy for steps that name none (default: retry forever).
+
+### Fan-out and choice
+
+Continuing a handle twice is a fan-out. Pass the arms to `Wiggle.all_of` and name the combine
+where they rejoin; a split that is never joined is rejected when the flow is defined, naming the
+steps left dangling. `Wiggle.one_of` takes arms that open with `when(guard)` or `otherwise()`:
+
+```python
+from wiggle import FlowSpec, Wiggle
+
+def order(f):
+    validated = f.then_apply("validate")
+
+    payment = validated.then_apply("charge")                        # two continuations of
+    shipping = validated.then_apply("reserve").then_apply("label")  # `validated`: a fan-out
+    paid = Wiggle.all_of(payment, shipping).combine("merge")        # mandatory explicit rejoin
+
+    return Wiggle.one_of(                                           # exactly one arm runs
+        paid.when("vip").then_apply("concierge"),
+        paid.otherwise().then_apply("thanks"),                      # last; without it, no match skips on
+    ).then_accept("notify")
+
+wf = FlowSpec.define("order", order)
+```
+
+An arm is named after its last step (`charge` and `label` above; an arm ending in a nested
+`all_of` takes its combine's name), and the combine receives each arm's result under that name.
+A gate inside an arm short-circuits to that arm's join, not the whole instance. Python control flow
+runs once while the flow is defined, so a `for` loop around `then_apply` records that many steps;
+anything that depends on a step's result belongs in `one_of`, `repeat_while` or `then_for_each`.
+
+The combine is bound with `handle_combine(workflow, step, fn)`: `fn` receives the context with
+each arm's result under the arm's name, and must return the **complete** post-join context — the
+engine replaces the context with it, so keys the handler omits do not survive the join (there is
+no implicit union of the arms). The engine stages the arm results under reserved keys; the worker
+hands them to `fn` under the arm names, and fails the step if an arm name is also a key of the
+context itself (rename one of them):
 
 ```python
 def merge(ctx):
-    out = {k: v for k, v in ctx.items() if k not in ("payment", "shipping")}  # carry the base
-    out.update(ctx.get("payment") or {})    # fold what each arm produced
-    out.update(ctx.get("shipping") or {})
+    out = {k: v for k, v in ctx.items() if k not in ("charge", "label")}  # carry the base
+    out.update(ctx.get("charge") or {})     # fold what each arm produced
+    out.update(ctx.get("label") or {})
     return out
 
 worker.handle_combine("order", "merge", merge)
 ```
 
-`Branch(name, steps)`, `Case(when, then)`, and the `body`/`escalation` fields are themselves lists of
-`Node`, so branches and bodies nest arbitrarily:
+### For each
 
-```python
-wf = Graph("order", [
-    Step("validate"),
-    Fork([                                                # parallel, joined
-        Branch("payment",  [Step("charge")]),
-        Branch("shipping", [Step("reserve"), Step("label")]),
-    ], combine="merge"),   # mandatory: branches rejoin at an explicit merge handler (handle_combine)
-    Choose([                                              # exactly one arm runs
-        Case(when="vip", then=[Step("concierge")]),
-        Case(then=[Step("thanks")]),                      # no `when` -> the otherwise case (must be last)
-    ]),
-    Effect("notify"),
-]).compile()
-```
-
-Branches touching different fields merge cleanly; if two write the same key, the later write wins.
-A `Gate` inside a branch short-circuits to that fork's join (not the whole instance).
-
-Runtime fan-out spawns one ISOLATED branch per element (list or map). The element IS each item's
+`then_for_each` spawns one ISOLATED branch per element (list or map). The element IS each item's
 context — the handler receives the value itself, and its return replaces it:
 
 ```python
 from wiggle import step
 
-wf = Graph("charge", [
-    ForEach("charge-items", items_key="items", body=[
-        Step("price"),
-    ], combine="collect"),
-    Step("summarise"),
-]).compile()
+wf = FlowSpec.define("charge", lambda f: f
+    .then_for_each("items", lambda item: item.then_apply("price"), name="charge-items")
+    .combine("collect")
+    .then_apply("summarise"))
 # start(wf, {"items": [1, 2, 3], "rate": 2}) -> one branch per item;
 # empty/missing skips the body AND the combine
 
@@ -143,30 +160,32 @@ def price(item):                              # the parameter IS the element (sc
 
 def collect(ctx):
     # base is also available as step.base() here (the staged results excluded) — your choice
-    prices = ctx.pop("charge-items")          # every item's FINAL VALUE, collected by the engine:
-    ctx["prices"] = prices                    # a list for a list input, a map for a map input
-    return ctx                                # the COMPLETE post-join context — it replaces
+    prices = ctx.pop("charge-items")          # every item's FINAL VALUE, collected by the engine
+    ctx["prices"] = prices                    # under the for-each's name: a list for a list input,
+    return ctx                                # a map for a map input. Return the COMPLETE context
 
 worker.handle("charge", "price", price)
 worker.handle_combine("charge", "collect", collect)
 ```
 
-Items can never touch the shared context; the combine assembles the final shape explicitly.
+Items can never touch the shared context; the combine assembles the final shape explicitly. The
+for-each node is named after `items_key` unless given `name=`.
 
-Per-step `queue` defaults to `default_queue` (a `Graph` field), else the workflow name. Retry policies:
+### Queues, retries, interop
+
+Per-step `queue` defaults to the queue set by `default_queue(...)`, else the workflow name. Retry policies:
 `RetryPolicy.exponential(attempts, initial_s)`, `RetryPolicy.fixed(attempts, backoff_s)`, `RetryPolicy.none()`,
 `RetryPolicy.forever()`. Raise `wiggle.PermanentActivityError` from a handler to fail a step **without** retrying.
 
-The node set —
-`Step`/`Gate`/`Effect`/`Fork`/`ForEach`/`Choose`/`DoWhile`/`SubWorkflow`/`Sleep`/`AwaitSignal` —
-matches the Java DSL and the Go client's declarative structs. A `SubWorkflow`'s child must be
-registered separately (`client.register(child)`), and some worker must serve the child's steps too.
-Because dispatch is by activity name (`"<workflow>#<step>"`), Python, Java, and Go workers interoperate:
-any can run another's steps.
+The same operators exist in the Java client (`thenApply`, `Wiggle.allOf`, …), and a flow defined in
+either compiles to the same kind of graph. A sub-flow's child must be registered separately
+(`client.register(child)`), and some worker must serve the child's steps too. Because dispatch is by
+activity name (`"<workflow>#<step>"`), Python, Java, and Go workers interoperate: any can run
+another's steps.
 
 ## Compensation (sagas)
 
-A step declared `compensate=True` is undone when the instance later fails: the engine runs the
+A step recorded with `then_apply_compensable` is undone when the instance later fails: the engine runs the
 step's **compensator** in the reverse pass (newest-completed first) as a real durable task, handing
 it a `wiggle.Compensation` with the step's **input/result context snapshots** captured at
 completion — not the instance's latest context, which a later step may have replaced. The instance
@@ -203,7 +222,7 @@ worker.start()
 | `handle_gate(workflow, step, test)` | predicate — `test(ctx) -> bool` (a gate / choose guard / do-while condition) |
 | `handle_effect(workflow, step, fn)` | side effect — `fn(ctx)` runs, the context is unchanged |
 | `handle_combine(workflow, step, fn)` | combine — `fn(ctx) -> ctx`, the complete post-join context (fork, for-each, or spawning step) |
-| `handle_compensation(workflow, step, fn)` | compensator — `fn(Compensation)` undoes a `compensate=True` step |
+| `handle_compensation(workflow, step, fn)` | compensator — `fn(Compensation)` undoes a `then_apply_compensable` step |
 | `branch_steps(workflow, *steps)` | declares steps that only run in runtime-created branches |
 
 On `start()` the worker **reconciles** every binding against the registered graph: it checks each
@@ -303,7 +322,7 @@ An emitted event rides the step's report and is committed in the same transactio
 attempt that raises leaves none behind, and its retry emits again. Consumers read emitted and
 lifecycle (`wf.*`) events through `client.poll_events` / `client.ack_events`. `step.name()` and
 `step.instance_id()` are available too, as are `step.base()`, `step.item_index()` and
-`step.item_map_key()` inside a `ForEach` body, and `step.create()` / `step.results()` for
+`step.item_map_key()` inside a `then_for_each` body, and `step.create()` / `step.results()` for
 [runtime branches](#branches-created-at-run-time). The worker reports each step's start and finish times, which
 feed `client.step_stats`.
 
@@ -318,7 +337,7 @@ old one). This is the safe, content-addressed default; you never set a number.
 Pin an explicit version when you want a stable, human-meaningful one (or to match another client):
 
 ```python
-wf = Graph("order", [Step("validate"), ...], version=3).compile()
+wf = FlowSpec.define("order", lambda f: f.then_apply("validate"), version=3)
 ```
 
 With an explicit version **you** own bumping it when the graph changes — the server overwrites the
@@ -332,16 +351,16 @@ unset unless you have a specific reason.
 
 ## Branches created at run time
 
-A step declared with a `combine` is a **spawning step**: its handler may open branches with
+A step followed by `.combine(name)` is a **spawning step**: its handler may open branches with
 `wiggle.step.create(input, key=None)`, each running its own chain of steps on an isolated copy of
 `input`. The branches ride the step's report and commit with it. The combine then receives their
 results through `wiggle.step.results()`: a list in creation order, or a dict by key when every branch
 has one.
 
 ```python
-from wiggle import Graph, Step, Worker, step
+from wiggle import FlowSpec, Worker, step
 
-flow = Graph("orders", [Step("fulfil", combine="summarise"), Step("notify")]).compile()
+flow = FlowSpec.define("orders", lambda f: f.then_apply("fulfil").combine("summarise").then_apply("notify"))
 
 def fulfil(order):
     for item in order["items"]:
@@ -391,11 +410,12 @@ step, node, kind, attempt, correlation id, creation time (the fields of `Task_`)
 the workflow declares from its context (`Task_.attr(name)`).
 
 ```python
-from wiggle import AttrType, Attribute, Graph, Step, Worker, criteria as c
+from wiggle import AttrType, FlowSpec, Worker, criteria as c
 from wiggle.criteria import Task_
 
-flow = Graph("orders", [Step("charge", queue="payments")],
-             attributes=[Attribute("tier", AttrType.STRING, "customer.tier")]).compile()
+flow = FlowSpec.define("orders", lambda f: f
+    .attribute("tier", AttrType.STRING, "customer.tier")
+    .then_apply("charge", queue="payments"))
 
 worker = Worker(client, "gold-1", criteria=[
     c.QueueCriteria("payments", c.and_(c.equal(Task_.attr("tier"), "gold"), c.less_than(Task_.ATTEMPT, 3))),

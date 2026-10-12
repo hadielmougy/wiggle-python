@@ -76,7 +76,7 @@ def create(input: Any, key: Optional[str] = None) -> Branch:
     scope = _current()
     if not scope.creates_branches:
         raise BranchError(f"step '{scope.name}' cannot create branches: only a step followed directly "
-                          f"by a combine (Step(..., combine=...)), or that combine, may call "
+                          f"by a combine (then_apply(...).combine(...)), or that combine, may call "
                           f"wiggle.step.create")
     branch = Branch(copy.deepcopy(input), key)
     scope.created.append(branch)

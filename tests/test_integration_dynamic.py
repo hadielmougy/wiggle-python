@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from wiggle import (AttrType, Attribute, Graph, Step, WiggleClient, Worker, criteria as c, step)
+from wiggle import AttrType, FlowSpec, WiggleClient, Worker, criteria as c, step
 
 URL = os.environ.get("WIGGLE_TEST_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="set WIGGLE_TEST_URL to run integration tests")
@@ -34,7 +34,7 @@ def _run(client, flow, worker, context, timeout_s=30.0):
 
 def test_a_step_creates_branches_that_run_different_chains(client):
     name = _name("py-dyn-fulfil")
-    flow = Graph(name, [Step("fulfil", combine="summarise")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("fulfil").combine("summarise"))
 
     def fulfil(order):
         for item in order["items"]:
@@ -79,7 +79,7 @@ class FanHandlers:
 
 def test_keyed_branches_reach_the_combine_as_a_dict(client):
     name = _name("py-dyn-keyed")
-    flow = Graph(name, [Step("fan", combine="gather")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("fan").combine("gather"))
     w = _worker(client, "dyn-keyed").register_handler(FanHandlers(), workflow=name)
     v = _run(client, flow, w, {"xs": {"a": 1, "b": 2}})
     assert v.status == "COMPLETED", v.error
@@ -88,7 +88,7 @@ def test_keyed_branches_reach_the_combine_as_a_dict(client):
 
 def test_a_step_that_creates_nothing_still_runs_its_combine(client):
     name = _name("py-dyn-empty")
-    flow = Graph(name, [Step("fan", combine="gather")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("fan").combine("gather"))
     w = (_worker(client, "dyn-empty")
          .handle(name, "fan", lambda ctx: ctx)
          .handle_combine(name, "gather", lambda ctx: {"n": len(step.results())}))
@@ -99,7 +99,7 @@ def test_a_step_that_creates_nothing_still_runs_its_combine(client):
 
 def test_a_combine_that_creates_branches_runs_another_round(client):
     name = _name("py-dyn-rounds")
-    flow = Graph(name, [Step("seed", combine="again")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("seed").combine("again"))
 
     def seed(ctx):
         step.create({"v": 1}).then_apply("inc")
@@ -124,8 +124,8 @@ def test_a_combine_that_creates_branches_runs_another_round(client):
 
 def test_server_side_operators_in_a_branch(client):
     name, child = _name("py-dyn-ops"), _name("py-dyn-child")
-    client.register(Graph(child, [Step("child-work")]).compile())
-    flow = Graph(name, [Step("plan", combine="done")]).compile()
+    client.register(FlowSpec.define(child, lambda f: f.then_apply("child-work")))
+    flow = FlowSpec.define(name, lambda f: f.then_apply("plan").combine("done"))
 
     def plan(ctx):
         (step.create({"n": 0, "size": 5})
@@ -176,7 +176,7 @@ def test_server_side_operators_in_a_branch(client):
 
 def test_nested_branches(client):
     name = _name("py-dyn-nested")
-    flow = Graph(name, [Step("lines", combine="packed-all")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("lines").combine("packed-all"))
 
     def lines(order):
         for line in order["lines"]:
@@ -203,7 +203,7 @@ def test_nested_branches(client):
 
 def test_a_compensable_branch_step_is_undone_when_the_instance_fails(client):
     name = _name("py-dyn-saga")
-    flow = Graph(name, [Step("book", combine="settle"), Step("boom")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("book").combine("settle").then_apply("boom"))
     undone = []
 
     def boom(ctx):
@@ -224,7 +224,7 @@ def test_a_compensable_branch_step_is_undone_when_the_instance_fails(client):
 
 def test_create_outside_a_spawning_step_fails_the_step(client):
     name = _name("py-dyn-misuse")
-    flow = Graph(name, [Step("plain")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.then_apply("plain"))
     w = _worker(client, "dyn-misuse").handle(
         name, "plain", lambda ctx: (step.create({}).then_apply("x"), ctx)[1])
     v = _run(client, flow, w, {})
@@ -235,8 +235,8 @@ def test_create_outside_a_spawning_step_fails_the_step(client):
 def test_queue_criteria_claim_only_the_matching_tasks(client):
     name = _name("py-crit")
     queue = name + "-q"
-    flow = Graph(name, [Step("work", queue=queue)],
-                 attributes=[Attribute("tier", AttrType.STRING, "customer.tier")]).compile()
+    flow = FlowSpec.define(name, lambda f: f.attribute("tier", AttrType.STRING, "customer.tier")
+                           .then_apply("work", queue=queue))
     client.register(flow)
     done = []
     gold_only = c.QueueCriteria(queue, c.and_(c.equal(c.Task_.WORKFLOW, name),

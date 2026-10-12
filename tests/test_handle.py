@@ -6,19 +6,18 @@ stored wrappers directly, so ``gradle build`` exercises the binding without a li
 import grpc
 import pytest
 
-from wiggle import Effect, Gate, Graph, Handlers, Step, Worker
+from wiggle import FlowSpec, Handlers, Worker
 from wiggle.worker import _canonical
 
 
 def _graph(*, authorise_queue="payments"):
     """The registered graph as ``get_workflow`` returns it: a Java-authored order flow that a Python
     worker will implement one step of, by name."""
-    return Graph("order-fulfilment", [
-        Step("validate"),
-        Gate("in-stock"),
-        Step("authorise", queue=authorise_queue),
-        Effect("audit"),
-    ]).compile().definition
+    return FlowSpec.define("order-fulfilment", lambda f: f
+                           .then_apply("validate")
+                           .then_filter("in-stock")
+                           .then_apply("authorise", queue=authorise_queue)
+                           .then_accept("audit")).definition
 
 
 class _FakeRpcError(grpc.RpcError):
@@ -281,7 +280,7 @@ def test_register_handlers_and_handle_conflict_is_a_duplicate():
 # ---------------------------------------------------------------- compensation (explicit surface)
 
 def _saga_graph():
-    return Graph("saga", [Step("reserve", compensate=True), Step("boom")]).compile().definition
+    return FlowSpec.define("saga", lambda f: f.then_apply_compensable("reserve").then_apply("boom")).definition
 
 
 def test_handle_compensation_registers_and_reconciles():
@@ -306,7 +305,7 @@ def test_forward_handler_on_compensable_step_requires_the_compensator():
 def test_handle_compensation_on_non_compensable_step_is_rejected():
     w = _worker({"saga": _saga_graph()})
     w.handle_compensation("saga", "boom", lambda comp: None)
-    with pytest.raises(ValueError, match="not declared compensate=True"):
+    with pytest.raises(ValueError, match="not declared compensable"):
         w._reconcile()
 
 

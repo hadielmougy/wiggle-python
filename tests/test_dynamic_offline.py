@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from wiggle import Attribute, Graph, Step, criteria as c, step
+from wiggle import AttrType, FlowSpec, criteria as c, step
 from wiggle import _binder
 from wiggle import step as _step_mod
 from wiggle.branch import Branch, BranchError
@@ -13,7 +13,7 @@ from wiggle.workflow import RetryPolicy
 
 
 def test_a_step_with_a_combine_compiles_to_a_dynamic_join_and_a_spawn_combine():
-    d = Graph("wf", [Step("fan", combine="gather"), Step("after")]).compile().definition
+    d = FlowSpec.define("wf", lambda f: f.then_apply("fan").combine("gather").then_apply("after")).definition
     by_name = {n.get("name"): n for n in d["nodes"]}
     by_id = {n["id"]: n for n in d["nodes"]}
     join = by_id[by_name["fan"]["next"]]
@@ -25,17 +25,18 @@ def test_a_step_with_a_combine_compiles_to_a_dynamic_join_and_a_spawn_combine():
 
 
 def test_declared_attributes_ride_the_definition_and_change_the_version():
-    plain = Graph("wf", [Step("a")]).compile()
-    with_attr = Graph("wf", [Step("a")], attributes=[Attribute("tier", "STRING", "customer.tier")]).compile()
+    plain = FlowSpec.define("wf", lambda f: f.then_apply("a"))
+    with_attr = FlowSpec.define("wf", lambda f: f.attribute("tier", AttrType.STRING, "customer.tier")
+                                .then_apply("a"))
     assert with_attr.definition["attributes"] == [{"name": "tier", "type": "STRING", "path": "customer.tier"}]
     assert "attributes" not in plain.definition
     assert plain.version != with_attr.version
-    with pytest.raises(ValueError):
-        Attribute("Tier", "STRING", "x")
-    with pytest.raises(ValueError):
-        Attribute("tier", "TEXT", "x")
-    with pytest.raises(ValueError):
-        Attribute("tier", "STRING", "a..b")
+    for name, type_, path in [("Tier", "STRING", "x"), ("tier", "TEXT", "x"), ("tier", "STRING", "a..b")]:
+        with pytest.raises(ValueError):
+            FlowSpec.define("wf", lambda f: f.attribute(name, type_, path).then_apply("a"))
+    with pytest.raises(ValueError, match="declared twice"):
+        FlowSpec.define("wf", lambda f: f.attribute("tier", AttrType.STRING, "a")
+                        .attribute("tier", AttrType.LONG, "b").then_apply("a"))
 
 
 def test_branch_builder_wire_form():
@@ -96,7 +97,7 @@ def test_create_is_refused_outside_a_spawning_step():
 
 
 def test_branch_steps_are_left_out_of_graph_matching_and_bound_on_dispatch():
-    graph = Graph("wf", [Step("fan", combine="gather")]).compile().definition
+    graph = FlowSpec.define("wf", lambda f: f.then_apply("fan").combine("gather")).definition
 
     class H:
         def fan(self, ctx): return ctx

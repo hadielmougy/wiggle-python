@@ -9,7 +9,7 @@ from concurrent import futures
 
 import grpc
 
-from wiggle import Graph, Step, WiggleClient
+from wiggle import FlowSpec, WiggleClient
 from wiggle._proto import wiggle_pb2 as pb
 from wiggle._proto import wiggle_pb2_grpc as rpc
 
@@ -30,7 +30,7 @@ def _free_port() -> int:
 def test_cold_start_register_waits_for_server():
     port = _free_port()
     client = WiggleClient(f"127.0.0.1:{port}")  # wait_for_ready defaults to True
-    wf = Graph("cold", [Step("a")]).compile()
+    wf = FlowSpec.define("cold", lambda f: f.then_apply("a"))
 
     result = {}
 
