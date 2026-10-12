@@ -4,8 +4,8 @@ The Java side models the context as a `Purchase` record; on the wire that's the 
 here it's just a dict. This worker binds `charge` on `typed-order` by name — no workflow definition,
 no shared type — and Java decodes the result back into its record. Run the Java demo first::
 
-    ./gradlew :example:runTypedPolyglot                       # terminal 1
-    python clients/python/examples/polyglot_typed_worker.py   # terminal 2
+    ./gradlew :example:runTypedPolyglot       # terminal 1, in the engine repo
+    python examples/polyglot_typed_worker.py  # terminal 2, in this repo
 """
 import os
 

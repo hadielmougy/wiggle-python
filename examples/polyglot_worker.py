@@ -5,8 +5,8 @@ name; :meth:`Worker.start` reconciles that binding against the graph the Java au
 the server, discovers that ``charge`` polls the ``payments`` queue, and serves it. Run the Java side
 first so the graph exists and instances are flowing::
 
-    ./gradlew :example:runPolyglot           # terminal 1: server + author + Java worker + a submitted order
-    python clients/python/examples/polyglot_worker.py   # terminal 2: this payments worker
+    ./gradlew :example:runPolyglot      # terminal 1, in the engine repo: server + author + Java worker + a submitted order
+    python examples/polyglot_worker.py  # terminal 2, in this repo: this payments worker
 
 The Java demo completes and prints the result as soon as this worker processes ``charge``.
 """
