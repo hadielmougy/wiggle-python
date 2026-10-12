@@ -78,4 +78,8 @@ __all__ = [
     "PermanentActivityError",
 ]
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import PackageNotFoundError, version as _version
+    __version__ = _version("wiggle-client")      # single source of truth: pyproject.toml
+except PackageNotFoundError:                     # running from a checkout that isn't installed
+    __version__ = "0.0.0+unknown"
