@@ -3,8 +3,7 @@
 An idiomatic Python client and worker for [Wiggle](../../README.md), the durable state-machine
 platform. It speaks the same gRPC control plane as the Java client, so **Python and Java workers
 interoperate** on the same server: define a flow in either language, and any worker that registers the
-matching handlers can run its steps. In a coordinator-sharded deployment the client resolves the
-owning cell per instance.
+matching handlers can run its steps.
 
 - **Control client** — register workflows, start and track instances, deliver signals, manage schedules.
 - **Worker** — implement steps by name; pull tasks you have capacity for, run handlers, report results; automatic lease heartbeats and retries.
@@ -68,7 +67,7 @@ register. Handlers are **not** part of the topology — a worker binds them sepa
 
 | Node | Meaning |
 |---|---|
-| `Step(name, queue=None, retry=None, compensate=False)` | a task run on a worker (`handle`); only changed context keys are merged back. `compensate=True` declares an undo run in the reverse pass if the instance later fails |
+| `Step(name, queue=None, retry=None, compensate=False)` | a task run on a worker (`handle`); its return replaces the context. `compensate=True` declares an undo run in the reverse pass if the instance later fails |
 | `Effect(name, queue=None, retry=None, compensate=False)` | a side-effect step (`handle_effect`); context unchanged |
 | `Gate(name, queue=None, retry=None)` | a predicate (`handle_gate`); false ends the instance as `gated:<name>` |
 | `Fork([Branch(name, steps), …], combine=…)` | run branches **in parallel** on isolated context copies, then rejoin at the **mandatory** `combine` step (`handle_combine`) — no implicit fold; needs ≥ 2 |
@@ -82,7 +81,9 @@ register. Handlers are **not** part of the topology — a worker binds them sepa
 A fork's combine is bound with `handle_combine(workflow, step, fn)`: `fn` receives the context with
 each branch's result staged under the branch's name, and must return the **complete** post-join
 context — the engine replaces the context with it, so keys the handler omits do not survive the
-join (there is no implicit union of the arms):
+join (there is no implicit union of the arms). The engine stages the arm results under reserved
+keys; the worker hands them to `fn` under the branch names, and fails the step if a branch name is
+also a key of the context itself (rename one of them):
 
 ```python
 def merge(ctx):
@@ -250,7 +251,32 @@ client.cancel(id, reason="cancelled")
 client.signal(id, name, payload=None)
 client.create_schedule(workflow, every_s=..|cron=.., context=None) / list_schedules() / delete_schedule(id)
 client.health() / client.cluster()
+
+client.register(flow_spec, force=True)                # replace a differing graph at the same version (server must allow it)
+client.poll_events(consumer, max_events=100, wait_s=10, start_from=0) -> EventBatch   # the durable event log
+client.ack_events(consumer, cursor=batch.events[-1].cursor)
+client.search(text, workflow=None, status=None, semantic=False, ...) -> SearchResult  # needs search shards
+client.step_stats(workflow, version=0) -> StepStats    # per-step duration and queue-wait percentiles
+client.backlog_coverage() -> BacklogCoverage           # ready work, and whether any worker would claim it
 ```
+
+## Step metadata and events
+
+Inside a handler, `wiggle.step` describes the running step and buffers domain events:
+
+```python
+from wiggle import step
+
+def ship(ctx):
+    step.emit("order.shipped", {"orderId": ctx["orderId"], "attempt": step.attempt()})
+    return ctx
+```
+
+An emitted event rides the step's report and is committed in the same transaction as the step: an
+attempt that raises leaves none behind, and its retry emits again. Consumers read emitted and
+lifecycle (`wf.*`) events through `client.poll_events` / `client.ack_events`. `step.name()` and
+`step.instance_id()` are available too. The worker reports each step's start and finish times, which
+feed `client.step_stats`.
 
 ## Versioning
 
@@ -277,17 +303,21 @@ unset unless you have a specific reason.
 
 ## Tests
 
-Offline tests (no server needed) cover the topology graph shapes and the wire conversions:
+Offline tests (no server needed) cover the topology graph shapes and the wire conversions; the
+integration tests run every construct end to end against a server:
 
 ```bash
 pip install -e '.[dev]'
-pytest -q
+pytest -q                                              # integration tests skip without a server
+WIGGLE_TEST_URL=localhost:8080 pytest -q tests/test_integration.py
 ```
 
 ## Notes & limits
 
 - **Execution mode:** Python-defined workflows run in `SERVER` mode. The worker does not implement
   the `LOCAL_SYNC`/`LOCAL_ASYNC` (client-side chaining) protocol, so serve those with a Java worker.
+- **Not yet supported** (Java client only for now): branches created at run time (`Step.create`) and
+  queue criteria (polling with a predicate).
 - **Numbers:** context travels as protobuf `Value` (doubles). Whole numbers come back as `int`;
   fractional values as `float` — the same JSON-number reality as the rest of the system.
 - **TLS:** pass `WiggleClient(target, credentials=grpc.ssl_channel_credentials(...))`.

@@ -190,11 +190,11 @@ def test_fork_creates_fork_join_and_mandatory_combine():
     assert join["expected"] == 2
     for start in fork["branches"]:
         assert start in byid                      # branch starts exist
-    # the join flows into the mandatory combine (a TASK carrying the arm names on itemsKey),
+    # the join flows into the mandatory combine (a TASK carrying the arm names),
     # and only then into "after" -- there is no implicit fold
     combine = next(n for n in byid.values() if n.get("name") == "merge")
     assert combine["kind"] == "TASK"
-    assert combine["itemsKey"] == '["l","r"]'
+    assert combine["armNames"] == ["l", "r"]
     assert join["next"] == combine["id"]
     after = next(n for n in byid.values() if n.get("name") == "after")
     assert combine["next"] == after["id"]
@@ -223,10 +223,10 @@ def test_for_each_dynfork_join_and_mandatory_combine():
     assert df["itemsKey"] == "items"   # the element is the item's context; no itemKey injection
     assert df["branches"] and df["next"] == join["id"]      # empty-collection skip -> join
     assert "expected" not in join                           # dynamic width, not a fixed count
-    # the join flows into the mandatory combine, whose itemsKey is a JSON STRING (the scratch key
-    # the collected item results stage under), and only then into "sum"
+    # the join flows into the mandatory combine, whose collectKey is the scratch key the collected
+    # item results stage under, and only then into "sum"
     combine = next(n for n in byid.values() if n.get("name") == "collect")
-    assert combine["kind"] == "TASK" and combine["itemsKey"] == '"each"'
+    assert combine["kind"] == "TASK" and combine["collectKey"] == "__forEach__each"
     assert join["next"] == combine["id"]
     assert combine["next"] == next(n for n in byid.values() if n.get("name") == "sum")["id"]
 

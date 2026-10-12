@@ -17,7 +17,7 @@ from ._convert import from_value
 from . import step as _step
 from . import _binder
 from ._binder import Compensation  # noqa: F401  (re-exported: wiggle.Compensation)
-from .client import WiggleClient
+from .client import ReportRefused, StepReport, WiggleClient
 from .workflow import Activity, Predicate, SideEffect
 
 log = logging.getLogger("wiggle.worker")
@@ -221,19 +221,15 @@ class Worker:
                     avail = sorted(a.split("#", 1)[1] for a in nodes)
                     raise ValueError(f"no step '{step}' in registered workflow '{wf}' "
                                      f"(available steps: {avail})")
-                is_combine = node["kind"] == "TASK" and node.get("itemsKey")
+                is_combine = _binder.is_combine(node)
                 if kind == "COMPENSATE":
                     if node["kind"] != "TASK" or is_combine or not node.get("compensable"):
                         raise ValueError(f"step '{step}' of workflow '{wf}' is not declared "
                                          f"compensate=True in the topology; handle_compensation "
                                          f"binds only compensable steps")
-                elif kind == "COMBINE" and not is_combine:
-                    raise ValueError(f"activity '{activity}' is not a fork combine; bind it with handle()")
                 elif kind == "COMBINE":
-                    # Expose the frozen base ambiently inside the combine: wiggle.step.base() and
-                    # popping the scratch key from the raw dict are both valid access styles.
-                    self._handlers[activity] = _binder.with_combine_base(
-                        self._handlers[activity], node["itemsKey"])
+                    if not is_combine:
+                        raise ValueError(f"activity '{activity}' is not a fork combine; bind it with handle()")
                 elif is_combine:
                     raise ValueError(f"activity '{activity}' is a fork combine; bind it with "
                                      f"handle_combine() -- its return is the complete post-join "
@@ -336,27 +332,52 @@ class Worker:
                               f"no handler registered for activity '{task.activity}'", retryable=False)
             return
 
-        stop_heartbeat = self._start_heartbeat(task)
-        scope = None
-        if task.HasField("base_context"):
-            # A forEach item step: the handler's parameter is the ITEM's value (scalars included);
-            # the frozen base and the element's index/source key ride on wiggle.step.
-            scope = _step._begin(from_value(task.base_context), task.item_index,
-                                 task.item_map_key or None)
         try:
-            result = handler(from_value(task.context))
+            ctx, combine_base = _binder.unstage(from_value(task.context), list(task.arm_names),
+                                                task.collect_key, task.step_name)
+        except ValueError as e:
+            self._client.fail(task.task_id, task.lease_owner, str(e), retryable=False)
+            return
+        stop_heartbeat = self._start_heartbeat(task)
+        # A forEach item step's parameter is the ITEM's value (scalars included); the frozen base and
+        # the element's index/source key ride on wiggle.step. A combine's base rides there too.
+        item = task.HasField("base_context")
+        base = from_value(task.base_context) if item else combine_base
+        scope = _step._begin(_step._Scope(
+            attempt=task.attempt, name=task.step_name, instance_id=task.instance_id,
+            base=base, has_base=item or combine_base is not None, item=item,
+            index=task.item_index, map_key=task.item_map_key or None))
+        started_at = int(time.time() * 1000)
+        t0 = time.monotonic()
+        try:
+            try:
+                result = handler(ctx)
+            finally:
+                emitted = list(_step._current().emitted)
+                _step._end(scope)
+            stop_heartbeat.set()
+            report = StepReport(task.node_id, started_at=started_at,
+                                finished_at=started_at + int((time.monotonic() - t0) * 1000),
+                                events=emitted)
             if task.kind == "PREDICATE":
-                self._client.complete(task.task_id, task.lease_owner, {"value": bool(result)})
+                if not isinstance(result, bool):
+                    self._client.fail(task.task_id, task.lease_owner,
+                                      f"predicate '{task.step_name}' returned "
+                                      f"{type(result).__name__}", retryable=False)
+                    return
+                report.predicate = result
             else:
-                self._client.complete(task.task_id, task.lease_owner, result)
+                report.merge = result
+            try:
+                self._client.report_steps(task.task_id, task.lease_owner, [report])
+            except ReportRefused as e:   # the lease was lost; the task re-runs elsewhere
+                log.warning("%s", e)
         except PermanentError as e:
             self._client.fail(task.task_id, task.lease_owner, str(e), retryable=False)
         except Exception as e:  # noqa: BLE001 - a handler failure is a step failure, retried
             log.debug("step %s of %s failed: %s", task.step_name, task.instance_id, e)
             self._client.fail(task.task_id, task.lease_owner, f"{type(e).__name__}: {e}", retryable=True)
         finally:
-            if scope is not None:
-                _step._end(scope)
             stop_heartbeat.set()
 
     def _start_heartbeat(self, task) -> threading.Event:

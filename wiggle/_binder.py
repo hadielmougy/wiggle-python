@@ -13,18 +13,19 @@ signature rule here is unit-testable against a compiled graph (mirrors the Java 
 
 A method's return annotation picks its kind: ``-> bool`` binds a gate, ``-> None`` a side
 effect, anything else (or no annotation) a task whose return REPLACES the context. A method
-matched to a combine node returns the complete post-join context; ``wiggle.step.base()`` is
-made available inside it (the staged scratch keys excluded).
+matched to a combine node returns the complete post-join context.
+
+:func:`unstage` is the third pure operation: it turns a combine activation's context into the
+shape a combine handler takes, and computes the base ``wiggle.step.base()`` exposes inside it.
 """
 from __future__ import annotations
 
 import inspect
-import json
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from . import step as _step
+from .workflow import ARM_SCRATCH_PREFIX, FOR_EACH_SCRATCH_PREFIX, STEPS_SCRATCH_PREFIX
 
 # tokens split on any non-alphanumeric run, and on camelCase / acronym boundaries
 _NON_ALNUM = re.compile(r"[^0-9A-Za-z]+")
@@ -150,7 +151,7 @@ def bind(workflow: str, candidates: dict[str, Candidate], graph: dict) -> Result
     # forward without its undo would strand the engine's reverse pass.
     for target, cand in compensators.items():
         step_name, node = by_canon[target]
-        if node["kind"] != "TASK" or node.get("itemsKey") or not node.get("compensable"):
+        if node["kind"] != "TASK" or is_combine(node) or not node.get("compensable"):
             raise ValueError(f"compensator '{cand.name}' targets step '{step_name}' of workflow "
                              f"'{workflow}', which is not declared compensate=True in the topology")
         bindings.append(Binding(f"{workflow}#{step_name}#compensate", step_name,
@@ -178,20 +179,40 @@ def _compensation_wrapper(method: Callable) -> Callable:
     return wrapped
 
 
-def with_combine_base(wrapper: Callable, items_key_json: str) -> Callable:
-    """Wraps a combine handler so ``wiggle.step.base()`` works inside it: the base is the staged
-    context minus the scratch key(s) (a forEach's collected-results key, or a fork's arm names)."""
-    parsed = json.loads(items_key_json)
-    scratch_keys = [parsed] if isinstance(parsed, str) else list(parsed)
+def is_combine(node: dict) -> bool:
+    """Whether a registered graph node is a fork or forEach combine: a TASK with ``armNames`` or a
+    ``collectKey``, or -- in a graph written before those fields -- an ``itemsKey``."""
+    return node.get("kind") == "TASK" and bool(
+        node.get("armNames") or node.get("collectKey") or node.get("itemsKey"))
 
-    def wrapped(ctx):
-        base = {k: v for k, v in ctx.items() if k not in scratch_keys} if isinstance(ctx, dict) else ctx
-        token = _step._begin(base, 0, None, item=False)
-        try:
-            return wrapper(ctx)
-        finally:
-            _step._end(token)
-    return wrapped
+
+def unstage(ctx: Any, arm_names: list, collect_key: str, step_name: str) -> tuple[Any, Any]:
+    """Rewrite a combine activation's context into the shape a combine handler takes -- each fork
+    arm's result under the arm's name, or a forEach's results under the forEach's name -- and
+    return it with the base (the context without them). Raises ``ValueError`` when such a name is
+    also a key of the workflow's own context, which the handler could not tell apart."""
+    if not isinstance(ctx, dict) or (not arm_names and not collect_key):
+        return ctx, None
+    base = dict(ctx)
+    placed = {}
+
+    def place(scratch: str, name: str) -> None:
+        if scratch not in base:
+            return
+        value = base.pop(scratch)
+        if name in base:
+            raise ValueError(f"combine '{step_name}': '{name}' is both a result to combine and a key "
+                             f"of the context; rename the branch or the key")
+        placed[name] = value
+
+    for arm in arm_names:
+        place(ARM_SCRATCH_PREFIX + arm, arm)
+    if collect_key:
+        base.pop(STEPS_SCRATCH_PREFIX + collect_key, None)
+        name = collect_key[len(FOR_EACH_SCRATCH_PREFIX):] \
+            if collect_key.startswith(FOR_EACH_SCRATCH_PREFIX) else collect_key
+        place(collect_key, name)
+    return {**base, **placed}, base
 
 
 def _wrapper_for(cand: Candidate, node: dict, activity: str) -> Callable:
@@ -207,7 +228,7 @@ def _wrapper_for(cand: Candidate, node: dict, activity: str) -> Callable:
             raise ValueError(f"activity '{activity}' is a gate (PREDICATE) but handler "
                              f"'{cand.name}' is annotated to return {ret!r}; a gate must return bool")
         return lambda ctx: bool(method(ctx))
-    if node.get("itemsKey"):
+    if is_combine(node):
         # A fork/forEach combine: the return is the COMPLETE post-join context, sent verbatim (no
         # diff) -- the engine replaces the context with it; there is no implicit fold.
         if ret is bool or ret is None:
@@ -215,7 +236,7 @@ def _wrapper_for(cand: Candidate, node: dict, activity: str) -> Callable:
                              f"must return the complete post-join context (a dict), not {ret!r}")
         def combine_wrapper(ctx):
             return method(ctx)
-        return with_combine_base(combine_wrapper, node["itemsKey"])
+        return combine_wrapper
     # TASK node: task unless the method is a declared side effect (-> None), a bool is a mistake here
     if ret is bool:
         raise ValueError(f"activity '{activity}' is a TASK but handler '{cand.name}' is annotated "

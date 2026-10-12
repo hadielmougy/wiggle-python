@@ -30,6 +30,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
 
+# The engine stages a join's results under reserved keys so they cannot collide with the workflow's
+# own data: a fork arm under ARM_SCRATCH_PREFIX + arm, a forEach's collected results under the
+# combine's collectKey, and the step that produced each result under STEPS_SCRATCH_PREFIX + collectKey.
+ARM_SCRATCH_PREFIX = "__arm__"
+FOR_EACH_SCRATCH_PREFIX = "__forEach__"
+STEPS_SCRATCH_PREFIX = "__steps__"
+
 _MAX_INT = 2_147_483_647
 
 Context = dict
@@ -341,18 +348,17 @@ class _Graph:
 
     def add_combine(self, name: str, arms: list[str]) -> str:
         """The mandatory merge node after a fork's join: a TASK bound by name like any step, carrying
-        the fork's arm names (a JSON array) on its ``itemsKey`` so the engine can stage each isolated
-        branch's result under its name for the handler, and strip those keys afterward."""
+        the fork's ``armNames`` so the engine can stage each isolated branch's result for the
+        handler, and strip it afterward."""
         nid = self.add_worker("TASK", name, None, None)
-        self.nodes[nid]["itemsKey"] = json.dumps(arms, separators=(",", ":"))
+        self.nodes[nid]["armNames"] = list(arms)
         return nid
 
-    def add_for_each_combine(self, name: str, scratch_key: str) -> str:
-        """The mandatory merge node after a forEach's join: a TASK bound by name whose ``itemsKey``
-        is a JSON STRING (the scratch key the engine stages the collected item results under) —
-        versus a fork combine's arm-name array."""
+    def add_for_each_combine(self, name: str, for_each_name: str) -> str:
+        """The mandatory merge node after a forEach's join: a TASK bound by name whose ``collectKey``
+        is the scratch key the engine stages the collected item results under."""
         nid = self.add_worker("TASK", name, None, None)
-        self.nodes[nid]["itemsKey"] = json.dumps(scratch_key)
+        self.nodes[nid]["collectKey"] = FOR_EACH_SCRATCH_PREFIX + for_each_name
         return nid
 
     def add_join(self, expected: int) -> str:
