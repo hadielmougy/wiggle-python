@@ -1,8 +1,8 @@
 """Ambient metadata for the step currently running on this thread of execution.
 
 A worker publishes the running task's identity around each handler call, so a handler can read
-``step.attempt()``, ``step.name()`` or ``step.instance_id()`` without extra parameters, and can
-``step.emit(...)`` domain events that ride the step's report.
+``step.attempt()``, ``step.name()`` or ``step.instance_id()`` without extra parameters, can
+``step.emit(...)`` domain events, and can ``step.create(...)`` branches; both ride the step's report.
 
 Inside a ``forEach`` item step, the handler's parameter is the ITEM's current value; the frozen
 pre-forEach context and the element's position/source key are available here instead of being
@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import builtins
 import contextvars
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from .branch import Branch, BranchError
 
 
 @dataclass
@@ -35,6 +38,10 @@ class _Scope:
     index: int = 0
     map_key: Optional[str] = None
     emitted: list = field(default_factory=list)
+    creates_branches: bool = False
+    results: Any = None
+    has_results: bool = False
+    created: list = field(default_factory=list)
 
 
 _SCOPE: contextvars.ContextVar[Optional[_Scope]] = contextvars.ContextVar("wiggle_step_scope", default=None)
@@ -54,6 +61,26 @@ def emit(type: str, payload: dict) -> None:
         raise TypeError(f"event '{type}' carries a {kind} payload; an event's payload is a dict, "
                         f"so a consumer can read a field from it")
     scope.emitted.append((type, payload))
+
+
+def create(input: Any, key: Optional[str] = None) -> Branch:
+    """Open a branch over ``input`` -- its whole, isolated context -- to chain steps onto:
+
+        for item in order["items"]:
+            step.create(item).then_apply("reserve").then_apply("ship")
+
+    Like :func:`emit`, the branch is buffered and rides this step's report: it runs once the step
+    completes, and an attempt that raises leaves nothing behind. Its result reaches the combine
+    after the step -- a list in creation order, or a dict by ``key`` when every branch has one. Only
+    a step declared with a ``combine`` (a spawning step), or that combine, may create branches."""
+    scope = _current()
+    if not scope.creates_branches:
+        raise BranchError(f"step '{scope.name}' cannot create branches: only a step followed directly "
+                          f"by a combine (Step(..., combine=...)), or that combine, may call "
+                          f"wiggle.step.create")
+    branch = Branch(copy.deepcopy(input), key)
+    scope.created.append(branch)
+    return branch
 
 
 def attempt() -> int:
@@ -80,6 +107,17 @@ def base() -> dict:
         raise RuntimeError("wiggle.step.base() is only available inside a forEach item step or a "
                            "fork/forEach combine")
     return scope.base
+
+
+def results() -> Any:
+    """Inside a combine: what it combines. For a spawning step's combine, the results of the
+    branches the step created -- a list in creation order, or a dict by key when the branches had
+    keys -- which reach it only here. For a forEach's combine the collected results, and for a
+    fork's combine a dict of each arm's result by arm name; those are also in its context."""
+    scope = _SCOPE.get()
+    if scope is None or not scope.has_results:
+        raise RuntimeError("wiggle.step.results() is only available inside a combine")
+    return scope.results
 
 
 def item_index() -> int:

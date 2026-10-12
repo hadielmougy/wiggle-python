@@ -301,6 +301,76 @@ unset unless you have a specific reason.
 > define the workflow in one place. (The Python content hash is its own — it does not equal the Java
 > client's number for the "same" workflow; cross-language interop is by activity name, not version.)
 
+## Branches created at run time
+
+A step declared with a `combine` is a **spawning step**: its handler may open branches with
+`wiggle.step.create(input, key=None)`, each running its own chain of steps on an isolated copy of
+`input`. The branches ride the step's report and commit with it. The combine then receives their
+results through `wiggle.step.results()`: a list in creation order, or a dict by key when every branch
+has one.
+
+```python
+from wiggle import Graph, Step, Worker, step
+
+flow = Graph("orders", [Step("fulfil", combine="summarise"), Step("notify")]).compile()
+
+def fulfil(order):
+    for item in order["items"]:
+        if item["digital"]:
+            step.create(item).then_accept("deliver-link", queue="digital")
+        else:
+            step.create(item, key=item["sku"]).then_apply("reserve").then_apply("ship")
+    return order
+
+def summarise(order):                      # the context is what fulfil returned
+    return {**order, "shipped": step.results()}
+
+worker = (Worker(client, "w1")
+          .branch_steps("orders", "deliver-link", "reserve", "ship")   # in no graph: bound on dispatch
+          .handle("orders", "fulfil", fulfil)
+          .handle_effect("orders", "deliver-link", deliver)
+          .handle("orders", "reserve", reserve)                    # step.base() is fulfil's return
+          .handle("orders", "ship", ship)
+          .handle_combine("orders", "summarise", summarise))
+```
+
+A branch offers `then_apply`, `then_accept`, `then_filter` (a false gate ends the branch), and
+`then_apply(..., compensate=True)` with an undo bound by `handle_compensation`. It also offers
+`then_sleep`, `then_await(signal, timeout_s=, escalation=)`, `then_sub_flow(node, workflow)`,
+`then_all_of(*arms, combine=)`, `repeat_while(condition, body, max_iterations=)` and
+`then_one_of(when(guard, chain), ..., otherwise(chain))`. A step chained in a branch takes the
+creating step's queue and retry policy unless given its own. `.combine(name)` after a branch task
+makes that task spawn too, so branches nest. A combine may itself `create`, which starts another
+round.
+
+Branch-only steps are in no registered graph, so declare them with `Worker.branch_steps` (or a
+`branch_steps` attribute on a `register_handlers` object). They are then bound by name the first time
+one is dispatched. A branch step on a queue no graph mentions runs only on a worker that polls that
+queue. Calling `step.create` anywhere but a spawning step or its combine fails the step.
+
+## Queue criteria
+
+A worker can claim only some of a queue's tasks: a predicate over the task's workflow, version,
+step, node, kind, attempt, correlation id, creation time, or **attributes** the workflow declares
+from its context.
+
+```python
+from wiggle import Attribute, Graph, Step, Worker, criteria as c
+
+flow = Graph("orders", [Step("charge", queue="payments")],
+             attributes=[Attribute("tier", "STRING", "customer.tier")]).compile()
+
+worker = Worker(client, "gold-1", criteria=[
+    c.QueueCriteria("payments", c.and_(c.equal(c.attr("tier"), "gold"), c.less_than(c.ATTEMPT, 3))),
+]).handle("orders", "charge", charge)
+```
+
+The operators are `equal`, `not_equal`, `in_`, `less_than(_or_equal)`, `greater_than(_or_equal)`,
+`between`, `like`, `is_null` and `is_not_null`, combined with `and_`, `or_` and `not_`. A comparison
+on an absent value is false. Criteria are checked against the server's limits when built.
+`criteria=` replaces `queues=`. `client.backlog_coverage()` shows ready work no live worker's criteria
+would claim.
+
 ## Tests
 
 Offline tests (no server needed) cover the topology graph shapes and the wire conversions; the
@@ -309,15 +379,13 @@ integration tests run every construct end to end against a server:
 ```bash
 pip install -e '.[dev]'
 pytest -q                                              # integration tests skip without a server
-WIGGLE_TEST_URL=localhost:8080 pytest -q tests/test_integration.py
+WIGGLE_TEST_URL=localhost:8080 pytest -q tests/
 ```
 
 ## Notes & limits
 
 - **Execution mode:** Python-defined workflows run in `SERVER` mode. The worker does not implement
   the `LOCAL_SYNC`/`LOCAL_ASYNC` (client-side chaining) protocol, so serve those with a Java worker.
-- **Not yet supported** (Java client only for now): branches created at run time (`Step.create`) and
-  queue criteria (polling with a predicate).
 - **Numbers:** context travels as protobuf `Value` (doubles). Whole numbers come back as `int`;
   fractional values as `float` — the same JSON-number reality as the rest of the system.
 - **TLS:** pass `WiggleClient(target, credentials=grpc.ssl_channel_credentials(...))`.

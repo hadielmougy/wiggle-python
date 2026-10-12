@@ -118,18 +118,28 @@ def test_combine_rejects_bool_or_none_annotations():
 
 
 def test_unstage_presents_fork_arms_by_name():
-    ctx, base = _binder.unstage({"n": 1, "__arm__l": {"s": "L"}, "__arm__r": {"s": "R"}},
-                                ["l", "r"], "", "merge")
+    ctx, base, results = _binder.unstage({"n": 1, "__arm__l": {"s": "L"}, "__arm__r": {"s": "R"}},
+                                         ["l", "r"], "", "merge")
     assert ctx == {"n": 1, "l": {"s": "L"}, "r": {"s": "R"}}
     assert base == {"n": 1}
+    assert results == {"l": {"s": "L"}, "r": {"s": "R"}}
 
 
 def test_unstage_presents_for_each_results_by_name():
-    ctx, base = _binder.unstage({"items": [1, 2], "__forEach__per-item": ["a", "b"],
-                                 "__steps____forEach__per-item": ["norm", "norm"]},
-                                [], "__forEach__per-item", "collect")
+    ctx, base, results = _binder.unstage({"items": [1, 2], "__forEach__per-item": ["a", "b"],
+                                          "__steps____forEach__per-item": ["norm", "norm"]},
+                                         [], "__forEach__per-item", "collect")
     assert ctx == {"items": [1, 2], "per-item": ["a", "b"]}
     assert base == {"items": [1, 2]}
+    assert results == ["a", "b"]
+
+
+def test_unstage_hands_created_branches_results_over_only_as_results():
+    ctx, base, results = _binder.unstage({"lines": [1], "__spawn__lines": [{"x": 1}],
+                                          "__steps____spawn__lines": ["pick"]},
+                                         [], "__spawn__lines", "packed")
+    assert ctx == base == {"lines": [1]}
+    assert results == [{"x": 1}]
 
 
 def test_unstage_refuses_a_name_the_context_already_has():
@@ -138,7 +148,7 @@ def test_unstage_refuses_a_name_the_context_already_has():
 
 
 def test_unstage_leaves_other_steps_alone():
-    assert _binder.unstage({"__arm__x": 1}, [], "", "s") == ({"__arm__x": 1}, None)
+    assert _binder.unstage({"__arm__x": 1}, [], "", "s") == ({"__arm__x": 1}, None, None)
 
 
 # ---------------------------------------------------------------- compensation pairing
